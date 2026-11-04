@@ -1,5 +1,5 @@
 'use strict';
-let token = null, selected = null, previewProvider = 'disabled', previewUrl = null;
+let token = null, selected = null, selectionReady = false, reprintPending = false, previewProvider = 'disabled', previewUrl = null;
 const $ = id => document.getElementById(id);
 async function api(path, options = {}) {
   const headers = Object.assign({}, options.headers || {}, {Authorization: 'Bearer ' + token});
@@ -24,7 +24,7 @@ async function status() {
   if (s.driver_restarts && s.driver_restarts.length) warnings.push('The driver restarted; unacknowledged in-memory data may have been lost. Review the API status.');
   $('warning').textContent = warnings.join(' ');
   $('warning').hidden = warnings.length === 0;
-  $('preview-button').disabled = !selected || previewProvider !== 'labelary';
+  $('preview-button').disabled = !selectionReady || previewProvider !== 'labelary';
 }
 async function jobs() {
   const q = encodeURIComponent($('q').value.trim());
@@ -40,13 +40,16 @@ async function jobs() {
 }
 function showError(error) { $('msg').textContent = error.message || String(error); }
 async function pick(id) {
-  selected = id;
+  selected = id; selectionReady = false;
+  $('reprint').disabled = true; $('preview-button').disabled = true;
+  $('title').textContent = 'Loading segment #' + id;
   const j = await (await api('/api/jobs/' + id)).json();
   if (selected !== id) return;
   $('title').textContent = 'Captured segment #' + j.id;
   $('meta').textContent = `${new Date(j.captured_at).toLocaleString()} • ${j.printer_name} • ${j.windows_port} • ${j.byte_count} bytes • ${j.boundary_reason} • SHA-256 ${j.sha256}`;
   $('raw').textContent = j.text || '';
-  $('reprint').disabled = false;
+  selectionReady = true;
+  $('reprint').disabled = reprintPending;
   $('preview-button').disabled = previewProvider !== 'labelary';
   $('msg').textContent = '';
   $('preview').replaceChildren();
@@ -60,12 +63,14 @@ $('unlock').addEventListener('click', async () => {
 });
 $('token').addEventListener('keydown', e => { if (e.key === 'Enter') $('unlock').click(); });
 $('reprint').addEventListener('click', async () => {
-  if (!selected || !confirm('Send this captured stream segment to the original printer queue? It may not contain a complete original job.')) return;
-  try { const result = await (await api('/api/jobs/' + selected + '/reprint', {method: 'POST'})).json(); $('msg').textContent = result.message; await jobs(); }
+  if (!selectionReady || reprintPending || !confirm('Send this captured stream segment to the original printer queue? It may not contain a complete original job.')) return;
+  const id = selected; reprintPending = true; $('reprint').disabled = true;
+  try { const result = await (await api('/api/jobs/' + id + '/reprint', {method: 'POST'})).json(); $('msg').textContent = result.message; await jobs(); }
   catch (e) { showError(e); }
+  finally { reprintPending = false; $('reprint').disabled = !selectionReady; }
 });
 $('preview-button').addEventListener('click', async () => {
-  if (!selected || !confirm('Send this segment, including its label contents, to Labelary for preview?')) return;
+  if (!selectionReady || !confirm('Send this segment, including its label contents, to Labelary for preview?')) return;
   try {
     const id = selected, response = await api('/api/jobs/' + id + '/preview', {method: 'POST'});
     const blob = await response.blob(); if (id !== selected) return;

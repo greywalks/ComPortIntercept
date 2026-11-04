@@ -51,7 +51,7 @@ Get-Content .\data\private\api-token
 
 Treat the token as a password. It is created locally and the Windows ACL is restricted to Administrators and SYSTEM. It is not stored in this repository. The web server only binds to `127.0.0.1`; the API requires the token and validates the Host and any Origin header. If startup cannot secure the token, it fails instead of exposing the API. To rotate it, stop the service, delete the token as an administrator, and restart.
 
-Print a test label to each printer and verify physical output, a new record, expected target, sensible byte content, and zero unexpected drop counters. Test a known captured segment using **Reprint Captured Segment**, then verify physical output separately. A `Possible Reprint` record is a time-and-hash match, not certain provenance.
+Print a test label to each printer and verify physical output, a new record, expected target, sensible byte content, and zero unexpected drop counters. Test a known captured segment using **Reprint Captured Segment**, then verify physical output separately. A `Possible Reprint` record is a time-and-hash match, not certain provenance. If a print or its audit update reports an uncertain outcome, check the physical printer before retrying.
 
 Follow [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the complete upgrade, testing and rollback sequence. The optional startup task uses an unlimited execution time and can be installed with `.\install\Install-StartupTask.ps1`; `-Mode System` requires the protected installation described above.
 
@@ -67,6 +67,7 @@ The test-ingest API is disabled by default. To run its optional diagnostic, set 
 
 ```powershell
 python -m unittest discover -s tests -v
+node --test tests/test_ui.js
 ```
 
 The test suite covers segmentation, pending-chunk recovery, loss visibility, API authorization, preview consent, legacy database migration, and mocked spooler behavior. GitHub Actions includes a Windows driver compilation job, but compilation and mocked tests cannot substitute for signing, Driver Verifier, plug/unplug, load, reboot and physical-print acceptance tests.

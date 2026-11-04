@@ -343,9 +343,15 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     raw_print(row["printer_name"], raw, f"ComPortIntercept Reprint #{row['id']}")
                 except Exception as exc:
-                    self.server.archive.finish_reprint(attempt, row["id"], exc)
-                    self.send_json({"ok": False, "error": str(exc)}, 409); return
-                self.server.archive.finish_reprint(attempt, row["id"])
+                    try:
+                        self.server.archive.finish_reprint(attempt, row["id"], exc)
+                    except Exception:
+                        pass  # Preserve the original print error and warn about its uncertain effect.
+                    self.send_json({"ok": False, "submitted": None, "error": f"Print failed or its outcome is uncertain: {exc}. Check the printer before retrying."}, 409); return
+                try:
+                    self.server.archive.finish_reprint(attempt, row["id"])
+                except Exception:
+                    self.send_json({"ok": False, "submitted": True, "error": "The spooler accepted this segment, but the audit record could not be updated. Check the printer before retrying."}, 500); return
                 self.send_json({"ok": True, "message": "Submitted to the Windows spooler; physical output is not confirmed"}); return
             self.send_json({"error": "Not found"}, 404)
         except (ValueError, KeyError, json.JSONDecodeError) as exc:

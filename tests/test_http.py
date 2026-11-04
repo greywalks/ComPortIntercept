@@ -74,6 +74,16 @@ class HttpTests(unittest.TestCase):
             printer.assert_called_once()
         self.assertEqual(self.archive.get_job(job)['reprint_count'], 1)
 
+    def test_audit_failure_after_spooler_acceptance_warns_not_to_retry(self):
+        job = self.archive.save_demo(1, b'^XA^XZ')
+        with patch('server.app.raw_print') as printer, patch.object(self.archive, 'finish_reprint', side_effect=OSError('disk full')):
+            status, body = self.request(f'/api/jobs/{job}/reprint', b'', self.auth())
+        self.assertEqual(status, 500)
+        data = json.loads(body)
+        self.assertTrue(data['submitted'])
+        self.assertIn('Check the printer before retrying', data['error'])
+        printer.assert_called_once()
+
     def test_only_loopback_binding_is_permitted(self):
         with self.assertRaises(ValueError): ArchiveServer(('0.0.0.0', 0), self.archive, self.token, self.config)
 
