@@ -11,6 +11,7 @@ from urllib.request import urlopen as client_urlopen
 from pathlib import Path
 from unittest.mock import patch
 
+from server import app
 from server.app import ArchiveServer, CaptureService, secure_token
 from server.archive import Archive
 
@@ -83,6 +84,13 @@ class HttpTests(unittest.TestCase):
         self.assertTrue(data['submitted'])
         self.assertIn('Check the printer before retrying', data['error'])
         printer.assert_called_once()
+
+    def test_second_server_does_not_touch_data_or_token(self):
+        with patch.dict(app.CONFIG, {'listen_host':'127.0.0.1', 'listen_port':self.server.server_address[1]}), \
+             patch.object(app, 'secure_token') as secure, patch.object(app, 'Archive') as open_archive:
+            with self.assertRaises(OSError): app.main()
+        secure.assert_not_called()
+        open_archive.assert_not_called()
 
     def test_only_loopback_binding_is_permitted(self):
         with self.assertRaises(ValueError): ArchiveServer(('0.0.0.0', 0), self.archive, self.token, self.config)

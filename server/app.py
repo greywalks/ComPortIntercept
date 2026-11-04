@@ -363,18 +363,22 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     if CONFIG.get("listen_host", "127.0.0.1") != "127.0.0.1":
         raise RuntimeError("listen_host must be 127.0.0.1")
-    archive = Archive(DATA, PRINTERS)
-    token = secure_token(DATA)
-    capture = CaptureService(archive, CONFIG)
-    server = ArchiveServer(("127.0.0.1", int(CONFIG.get("listen_port", 8765))), archive, token, CONFIG, capture)
-    capture.start()
-    print(f"Archive running at http://127.0.0.1:{server.server_address[1]} (API token: data/private/api-token)")
+    # Bind first. A second instance must not touch the database or token ACLs.
+    server = ArchiveServer(("127.0.0.1", int(CONFIG.get("listen_port", 8765))), None, None, CONFIG)
+    capture = None
     try:
+        token = secure_token(DATA)
+        archive = Archive(DATA, PRINTERS)
+        capture = CaptureService(archive, CONFIG)
+        server.archive, server.token, server.capture = archive, token, capture
+        capture.start()
+        print(f"Archive running at http://127.0.0.1:{server.server_address[1]} (API token: data/private/api-token)")
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        capture.stop()
+        if capture:
+            capture.stop()
         server.server_close()
 
 
