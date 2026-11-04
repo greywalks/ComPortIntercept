@@ -53,6 +53,13 @@ typedef struct _CAPTURE_STATS_V2 {
     ULONGLONG DroppedBytes;
 } CAPTURE_STATS_V2, *PCAPTURE_STATS_V2;
 
+/* Keep the wire layout and CTL_CODE values in sync with server/app.py. */
+C_ASSERT(FIELD_OFFSET(CAPTURE_OUTPUT_V2, Data) == 40 &&
+         sizeof(CAPTURE_ACK_V2) == 16 && sizeof(CAPTURE_STATS_V2) == 40 &&
+         IOCTL_ZEBRAUSBTAP_PEEK == 0x226008 &&
+         IOCTL_ZEBRAUSBTAP_ACK == 0x22600C &&
+         IOCTL_ZEBRAUSBTAP_STATS == 0x226010);
+
 DRIVER_INITIALIZE DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD ZebraEvtDeviceAdd;
 EVT_WDFDEVICE_WDM_IRP_PREPROCESS ZebraEvtWdmWritePreprocess;
