@@ -1,4 +1,5 @@
 import tempfile
+import tracemalloc
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -56,11 +57,75 @@ class ArchiveTests(unittest.TestCase):
         self.archive.put_chunk('s', 1, 1, 0, b'FIRST')
         self.archive.put_chunk('s', 2, 1, 8_000_000, b'SECOND')
         self.assembler.recover()
+        self.assembler.flush_idle(force=True)
         rows = self.archive.list_jobs()
         self.assertEqual(len(rows), 2)
         payloads = {self.archive.read_raw(self.archive.get_job(r['id'])) for r in rows}
         self.assertEqual(payloads, {b'FIRST', b'SECOND'})
         self.assertIn('capture-idle', {r['boundary_reason'] for r in rows})
+
+    def test_recovery_joins_later_driver_chunk_within_capture_gap(self):
+        self.archive.put_chunk('s', 1, 1, 10_000_000, b'^XA^FDHELLO ')
+        recovered = StreamAssembler(self.archive, 400, 1024 * 1024, self.clock)
+        recovered.recover()
+        self.assertEqual(self.archive.list_jobs(), [])
+        self.archive.put_chunk('s', 2, 1, 10_010_000, b'WORLD^FS^XZ')
+        recovered.feed('s', 2, 1, b'WORLD^FS^XZ', 10_010_000)
+        recovered.flush_idle(force=True)
+        self.assertEqual(self.archive.read_raw(self.first()), b'^XA^FDHELLO WORLD^FS^XZ')
+
+    def test_new_driver_session_finalizes_only_old_pending_segments(self):
+        self.archive.put_chunk('old', 1, 1, 10, b'old')
+        recovered = StreamAssembler(self.archive, 400, 1024 * 1024, self.clock)
+        recovered.recover(); recovered.finish_other_sessions('new')
+        self.assertEqual(self.archive.read_raw(self.first()), b'old')
+        self.assertEqual(self.first()['boundary_reason'], 'recovered-after-driver-change')
+
+    def test_observed_timestamp_is_distinct_from_archive_time(self):
+        self.archive.put_chunk('s', 1, 1, 10, b'FIRST', '2024-01-01T00:00:00.000+00:00')
+        self.archive.put_chunk('s', 2, 1, 10_000_010, b'SECOND', '2024-01-01T00:00:01.000+00:00')
+        recovered = StreamAssembler(self.archive, 400, 1024 * 1024, self.clock)
+        recovered.recover(); recovered.flush_idle(force=True)
+        rows = list(reversed(self.archive.list_jobs()))
+        self.assertEqual([r['captured_at'] for r in rows], ['2024-01-01T00:00:00.000+00:00','2024-01-01T00:00:01.000+00:00'])
+        self.assertTrue(all(r['time_quality'] == 'driver-utc' for r in rows))
+        self.assertTrue(all(r['archived_at'] != r['captured_at'] for r in rows))
+
+    def test_session_loss_flags_old_and_new_segments_and_requires_ack(self):
+        self.add(1, b'EARLY'); self.assembler.flush_idle(force=True)
+        old = self.first()
+        self.archive.record_loss('s', 1, 12)
+        self.assertEqual(self.archive.get_job(old['id'])['integrity'], 'capture-loss-possible')
+        self.add(2, b'LATE'); self.assembler.flush_idle(force=True)
+        new = self.first()
+        self.assertEqual(new['integrity'], 'capture-loss-possible')
+        with self.assertRaises(PermissionError): self.archive.start_reprint(new)
+        attempt = self.archive.start_reprint(new, acknowledge_loss=True)
+        c = self.archive.connect()
+        try: self.assertEqual(c.execute('SELECT risk_acknowledged FROM reprint_attempts WHERE id=?',(attempt,)).fetchone()[0], 1)
+        finally: c.close()
+
+    def test_search_finds_text_after_nul_without_changing_raw_bytes(self):
+        raw = b'\0^XA^FDCUSTOMER-123^FS^XZ'
+        job = self.archive.save_demo(1, raw)
+        self.assertEqual(self.archive.list_jobs('CUSTOMER-123')[0]['id'], job)
+        self.assertEqual(self.archive.read_raw(self.archive.get_job(job)), raw)
+
+    def test_history_query_projects_snippets_before_loading_records(self):
+        text = 'X' * (256 * 1024)
+        c = self.archive.connect()
+        try:
+            c.executemany('INSERT INTO jobs(captured_at,target_id,printer_name,windows_port,byte_count,sha256,raw_path,text) VALUES(?,?,?,?,?,?,?,?)',
+                          [('2026-01-01',1,'Test','USB001',len(text),'sha','jobs/test.bin',text)] * 100)
+            c.commit()
+        finally: c.close()
+        tracemalloc.start()
+        try:
+            rows = self.archive.list_jobs(); _, peak = tracemalloc.get_traced_memory()
+        finally: tracemalloc.stop()
+        self.assertEqual(len(rows), 100)
+        self.assertLess(peak, 8 * 1024 * 1024)
+        self.assertEqual(len(rows[0]['text']), 256)
 
     def test_unterminated_zpl_is_bounded(self):
         self.add(1, b'^XA' + b'a' * (1024 * 1024 - 3))
@@ -72,9 +137,12 @@ class ArchiveTests(unittest.TestCase):
         self.archive.put_chunk(42, 1, 1, 0, b'^XAhello')
         self.assertFalse(self.archive.put_chunk(42, 1, 1, 0, b'^XAhello'))
         self.archive.put_chunk(42, 2, 1, 0, b'^XZ')
-        StreamAssembler(self.archive, 400, 1024 * 1024, self.clock).recover()
+        recovered = StreamAssembler(self.archive, 400, 1024 * 1024, self.clock)
+        recovered.recover()
+        self.assertEqual(self.archive.list_jobs(), [])
+        recovered.flush_idle(force=True)
         self.assertEqual(self.archive.read_raw(self.first()), b'^XAhello^XZ')
-        self.assertEqual(self.first()['boundary_reason'], 'recovered-after-restart')
+        self.assertEqual(self.first()['boundary_reason'], 'idle')
         StreamAssembler(self.archive, 400, 1024 * 1024, self.clock).recover()
         self.assertEqual(len(self.archive.list_jobs()), 1)
         self.assertFalse(self.archive.put_chunk(42, 1, 1, 0, b'^XAhello'))
@@ -86,7 +154,8 @@ class ArchiveTests(unittest.TestCase):
         with patch.object(self.archive, 'save_segment', side_effect=OSError('disk full')):
             with self.assertRaises(OSError): self.assembler.flush_idle(force=True)
         self.assertEqual(len(self.archive.pending_chunks()), 1)
-        StreamAssembler(self.archive, 400, 1024 * 1024, self.clock).recover()
+        recovered = StreamAssembler(self.archive, 400, 1024 * 1024, self.clock)
+        recovered.recover(); recovered.flush_idle(force=True)
         self.assertEqual(self.archive.read_raw(self.first()), b'^XAhello^XZ')
 
     def test_test_ingestion_never_touches_capture_assembler(self):

@@ -14,25 +14,36 @@ import time
 import urllib.error
 import urllib.request
 from ctypes import wintypes
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 try:
     from .archive import Archive, StreamAssembler, now
+    from .security import secure_archive_data
 except ImportError:  # python server/app.py
     from archive import Archive, StreamAssembler, now
+    from security import secure_archive_data
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
 CONFIG = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
 PRINTERS = {int(p["target_id"]): p for p in CONFIG["printers"]}
 CAPTURE_DEVICE = CONFIG.get("capture_device", r"\\.\ZebraUsbTap")
-IOCTL_PEEK, IOCTL_ACK, IOCTL_STATS = 0x226008, 0x22600C, 0x226010
-HEADER = struct.Struct("<IIIIQQQ")
+IOCTL_PEEK, IOCTL_ACK, IOCTL_STATS = 0x226014, 0x226018, 0x22601C
+HEADER = struct.Struct("<IIIIQQQQQQ")
 STATS = struct.Struct("<IIQQQQ")
 MAX_CHUNK = 1024 * 1024
 MAX_HTTP_BODY = 2 * 1024 * 1024
+
+
+def filetime_to_iso(ticks):
+    """Convert Windows' 100 ns UTC FILETIME ticks without using local time."""
+    if ticks <= 0:
+        raise ValueError("Invalid driver observation time")
+    value = datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=ticks // 10)
+    return value.isoformat(timespec="milliseconds")
 
 
 def secure_token(data_dir):
@@ -128,20 +139,26 @@ class CaptureService:
             buffer = ctypes.create_string_buffer(MAX_CHUNK + HEADER.size)
             statsbuf = ctypes.create_string_buffer(STATS.size)
             next_stats = 0.0
+            recorded_losses = {}
+            def record_new_loss(session, dropped, dropped_bytes):
+                previous = recorded_losses.get(session, (0, 0))
+                if dropped and (dropped > previous[0] or (dropped == previous[0] and dropped_bytes > previous[1])):
+                    self.archive.record_loss(session, dropped, dropped_bytes)
+                    recorded_losses[session] = (dropped, dropped_bytes)
             while not self.stop_event.is_set():
                 if time.monotonic() >= next_stats:
                     got = wintypes.DWORD()
                     if not control(handle, IOCTL_STATS, None, 0, statsbuf, len(statsbuf), ctypes.byref(got), None):
                         code = ctypes.get_last_error()
-                        raise RuntimeError(f"Driver protocol v2 unavailable (Windows error {code}); update driver and service together")
+                        raise RuntimeError(f"Driver protocol v3 unavailable (Windows error {code}); update driver and service together")
                     if got.value != STATS.size:
                         raise RuntimeError("Invalid driver statistics response")
                     version, _, session, queued, dropped, dropped_bytes = STATS.unpack(statsbuf.raw)
-                    if version != 2:
+                    if version != 3:
                         raise RuntimeError(f"Unsupported driver protocol {version}")
                     self.archive.observe_session(session, queued)
-                    if dropped:
-                        self.archive.record_loss(session, dropped, dropped_bytes)
+                    record_new_loss(session, dropped, dropped_bytes)
+                    assembler.finish_other_sessions(session)
                     self.update(connected=True, last_error=None, driver_session=str(session), queued_bytes=queued,
                                 dropped_chunks=dropped, dropped_bytes=dropped_bytes)
                     next_stats = time.monotonic() + 0.5
@@ -155,20 +172,22 @@ class CaptureService:
                     raise OSError(code, "Capture peek failed")
                 if got.value < HEADER.size:
                     raise RuntimeError("Short capture header")
-                version, target, length, _, seq, session, stamp = HEADER.unpack_from(buffer.raw)
-                if version != 2 or length > MAX_CHUNK or got.value != HEADER.size + length:
+                version, target, length, _, seq, session, stamp, utc_ticks, lost, lost_bytes = HEADER.unpack_from(buffer.raw)
+                if version != 3 or length > MAX_CHUNK or got.value != HEADER.size + length:
                     raise RuntimeError("Invalid capture response")
                 raw = bytes(buffer.raw[HEADER.size:HEADER.size + length])
-                inserted = self.archive.put_chunk(session, seq, target, stamp, raw)
+                observed_at = filetime_to_iso(utc_ticks)
+                record_new_loss(session, lost, lost_bytes)
+                inserted = self.archive.put_chunk(session, seq, target, stamp, raw, observed_at)
                 ack_data = ctypes.create_string_buffer(struct.pack("<QQ", session, seq))
                 ack_got = wintypes.DWORD()
                 if not control(handle, IOCTL_ACK, ack_data, 16, None, 0, ctypes.byref(ack_got), None):
                     raise OSError(ctypes.get_last_error(), "Capture acknowledgement failed")
                 if inserted:
-                    assembler.feed(session, seq, target, raw, stamp)
-                self.update(last_capture_at=now())
-                assembler.flush_idle()
-            assembler.flush_idle(force=True, reason="service-stop")
+                    assembler.feed(session, seq, target, raw, stamp, observed_at)
+                self.update(last_capture_at=observed_at)
+            # Unfinished chunks stay in SQLite for the next process. Flushing
+            # here could split them from data still queued in the driver.
         finally:
             close(handle)
             self.update(connected=False)
@@ -214,17 +233,20 @@ def raw_print(queue, raw, title):
         ws.ClosePrinter(hp)
 
 
-def render_preview(raw, target_id, config, printers):
+def render_preview(raw, target_id, config, printers, index=0):
     if config.get("preview_provider", "disabled") != "labelary":
         raise RuntimeError("External previews are disabled")
     p = printers[target_id]
     base = config.get("labelary_url", "https://api.labelary.com").rstrip("/")
     if not base.startswith("https://"):
         raise RuntimeError("Preview service must use HTTPS")
-    url = base + f"/v1/printers/{p.get('label_dpmm',8)}dpmm/labels/{p.get('label_width_in',4)}x{p.get('label_height_in',6)}/0/"
+    if not isinstance(index, int) or not 0 <= index <= 9999:
+        raise ValueError("Invalid preview label index")
+    url = base + f"/v1/printers/{p.get('label_dpmm',8)}dpmm/labels/{p.get('label_width_in',4)}x{p.get('label_height_in',6)}/{index}/"
     req = urllib.request.Request(url, data=raw, method="POST", headers={"Accept": "image/png", "Content-Type": "application/x-www-form-urlencoded"})
     with urllib.request.urlopen(req, timeout=15) as response:
-        return response.read(4 * 1024 * 1024 + 1)
+        count = response.headers.get("X-Total-Count", "")
+        return response.read(4 * 1024 * 1024 + 1), (int(count) if count.isdigit() else None)
 
 
 class ArchiveServer(ThreadingHTTPServer):
@@ -295,6 +317,7 @@ class Handler(BaseHTTPRequestHandler):
             state = self.server.capture.status() if self.server.capture else {"connected": False}
             self.send_json({"ok": True, **state, "capture_connected": state.get("connected", False),
                             "capture_error": state.get("last_error"), "loss_events": self.server.archive.recent_losses(), "driver_restarts": self.server.archive.recent_restarts(),
+                            "pending_chunks": self.server.archive.pending_count(),
                             "preview_provider": self.server.config.get("preview_provider", "disabled"),
                             "printers": list(self.server.archive.printers.values())}); return
         if path == "/api/jobs":
@@ -334,12 +357,19 @@ class Handler(BaseHTTPRequestHandler):
             if not row: self.send_json({"error": "Not found"}, 404); return
             raw = self.server.archive.read_raw(row)
             if parts[3] == "preview":
-                img = render_preview(raw, row["target_id"], self.server.config, self.server.archive.printers)
+                index = int(parse_qs(urlsplit(self.path).query).get("index", ["0"])[0])
+                img, count = render_preview(raw, row["target_id"], self.server.config, self.server.archive.printers, index)
                 if len(img) > 4 * 1024 * 1024: raise ValueError("Preview exceeds size limit")
                 self.send_response(200); self.send_header("Content-Type", "image/png")
+                if count is not None: self.send_header("X-Total-Count", str(count))
                 self.send_header("Content-Length", str(len(img))); self.security_headers(); self.end_headers(); self.wfile.write(img); return
             if parts[3] == "reprint":
-                attempt = self.server.archive.start_reprint(row)
+                data = json.loads(body.decode("utf-8")) if body else {}
+                if not isinstance(data, dict): raise ValueError("Expected a JSON object")
+                try:
+                    attempt = self.server.archive.start_reprint(row, acknowledge_loss=data.get("acknowledge_loss") is True)
+                except PermissionError as exc:
+                    self.send_json({"ok": False, "code": "capture_loss_risk", "error": str(exc)}, 409); return
                 try:
                     raw_print(row["printer_name"], raw, f"ComPortIntercept Reprint #{row['id']}")
                 except Exception as exc:
@@ -367,6 +397,7 @@ def main():
     server = ArchiveServer(("127.0.0.1", int(CONFIG.get("listen_port", 8765))), None, None, CONFIG)
     capture = None
     try:
+        secure_archive_data(DATA)
         token = secure_token(DATA)
         archive = Archive(DATA, PRINTERS)
         capture = CaptureService(archive, CONFIG)

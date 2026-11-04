@@ -23,10 +23,10 @@ class FakeKernel:
         self.DeviceIoControl = Fn(self.control)
     def control(self, h, code, ib, il, ob, ol, got, ov):
         if code == app.IOCTL_STATS:
-            raw = app.STATS.pack(2, 0, 123, 9, 0, 0)
+            raw = app.STATS.pack(3, 0, 123, 9, 0, 0)
         elif code == app.IOCTL_PEEK:
             payload = b'RAW-WRITE'
-            raw = app.HEADER.pack(2, 1, len(payload), 0, 1, 123, 77) + payload
+            raw = app.HEADER.pack(3, 1, len(payload), 0, 1, 123, 77, 134116992000000000, 0, 0) + payload
         elif code == app.IOCTL_ACK:
             self.acked.append(struct.unpack('<QQ', ctypes.string_at(ib, il)))
             # Acknowledgment is never allowed before the chunk transaction commits.
@@ -40,7 +40,8 @@ class FakeKernel:
 
 class FakeAssembler:
     def __init__(self): self.chunks = []
-    def feed(self, session, seq, target, raw, stamp=None): self.chunks.append((session, seq, target, raw))
+    def feed(self, session, seq, target, raw, stamp=None, observed_at=None): self.chunks.append((session, seq, target, raw))
+    def finish_other_sessions(self, session): pass
     def flush_idle(self, **kwargs): pass
 
 class ProtocolTests(unittest.TestCase):
@@ -52,8 +53,29 @@ class ProtocolTests(unittest.TestCase):
                 service._poll_windows(assembler)
             self.assertEqual(kernel.acked, [(123, 1)])
             self.assertEqual(assembler.chunks, [(123, 1, 1, b'RAW-WRITE')])
+            self.assertEqual(archive.pending_chunks()[0]['observed_at'], '2026-01-01T00:00:00.000+00:00')
             self.assertEqual(len(archive.pending_chunks()), 1)
             self.assertFalse(service.status()['connected'])
+
+    def test_loss_snapshot_is_saved_before_chunk_is_acknowledged(self):
+        with tempfile.TemporaryDirectory() as root:
+            archive = Archive(root, PRINTERS); service = app.CaptureService(archive, {})
+            class LossKernel(FakeKernel):
+                def control(self, h, code, ib, il, ob, ol, got, ov):
+                    if code == app.IOCTL_PEEK:
+                        payload = b'RAW-WRITE'
+                        raw = app.HEADER.pack(3, 1, len(payload), 0, 1, 123, 77, 134116992000000000, 2, 99) + payload
+                        ctypes.memmove(ob, raw, len(raw))
+                        ctypes.cast(got, ctypes.POINTER(wintypes.DWORD))[0] = len(raw)
+                        return 1
+                    return super().control(h, code, ib, il, ob, ol, got, ov)
+            kernel = LossKernel(service, archive)
+            with patch.object(ctypes, 'WinDLL', create=True, return_value=kernel):
+                service._poll_windows(FakeAssembler())
+            self.assertEqual(archive.recent_losses()[0]['dropped_bytes'], 99)
+            from server.archive import StreamAssembler
+            recovered = StreamAssembler(archive); recovered.recover(); recovered.flush_idle(force=True)
+            self.assertEqual(archive.list_jobs()[0]['integrity'], 'capture-loss-possible')
 
     def test_disk_error_does_not_acknowledge_chunk(self):
         with tempfile.TemporaryDirectory() as root:

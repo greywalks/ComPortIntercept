@@ -63,6 +63,38 @@ class HttpTests(unittest.TestCase):
             self.assertEqual(self.request(f'/api/jobs/{job}/preview', b'', self.auth())[0], 409)
             external.assert_not_called()
 
+    def test_loss_flag_blocks_reprint_until_explicitly_acknowledged(self):
+        from server.archive import StreamAssembler
+        self.archive.put_chunk('session', 1, 1, 0, b'^XA^XZ')
+        assembler = StreamAssembler(self.archive)
+        assembler.recover(); assembler.flush_idle(force=True)
+        job = self.archive.list_jobs()[0]['id']
+        self.archive.record_loss('session', 1, 4)
+        with patch('server.app.raw_print') as printer:
+            status, body = self.request(f'/api/jobs/{job}/reprint', b'', self.auth())
+            self.assertEqual(status, 409)
+            self.assertEqual(json.loads(body)['code'], 'capture_loss_risk')
+            printer.assert_not_called()
+            payload = json.dumps({'acknowledge_loss': True}).encode()
+            status, body = self.request(f'/api/jobs/{job}/reprint', payload, self.auth())
+            self.assertEqual(status, 200)
+            printer.assert_called_once()
+
+    def test_preview_exposes_label_count_and_requested_index(self):
+        self.config['preview_provider'] = 'labelary'
+        job = self.archive.save_demo(1, b'^XAone^XZ^XAtwo^XZ')
+        class ExternalResponse:
+            headers = {'X-Total-Count':'2'}
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def read(self, size): return b'pngbytes'
+        with patch('server.app.urllib.request.urlopen', return_value=ExternalResponse()) as external:
+            req = urllib.request.Request(self.base + f'/api/jobs/{job}/preview?index=1', data=b'', headers=self.auth(), method='POST')
+            with client_urlopen(req, timeout=3) as response:
+                self.assertEqual(response.headers['X-Total-Count'], '2')
+                self.assertEqual(response.read(), b'pngbytes')
+            self.assertTrue(external.call_args[0][0].full_url.endswith('/1/'))
+
     def test_reprint_failure_is_not_counted(self):
         job = self.archive.save_demo(1, b'^XA^XZ')
         with patch('server.app.raw_print', side_effect=OSError('spooler failed')):
@@ -87,9 +119,10 @@ class HttpTests(unittest.TestCase):
 
     def test_second_server_does_not_touch_data_or_token(self):
         with patch.dict(app.CONFIG, {'listen_host':'127.0.0.1', 'listen_port':self.server.server_address[1]}), \
-             patch.object(app, 'secure_token') as secure, patch.object(app, 'Archive') as open_archive:
+             patch.object(app, 'secure_token') as secure, patch.object(app, 'secure_archive_data') as secure_data, patch.object(app, 'Archive') as open_archive:
             with self.assertRaises(OSError): app.main()
         secure.assert_not_called()
+        secure_data.assert_not_called()
         open_archive.assert_not_called()
 
     def test_only_loopback_binding_is_permitted(self):

@@ -1,6 +1,6 @@
 # Lessons learned during the first deployment
 
-> Historical notes for the original 1.0 driver. Protocol v2 changes capture and cleanup; none of the original physical tests validates the new driver. Follow the current deployment acceptance procedure.
+> Historical notes for the original 1.0 driver. Later protocols change capture and cleanup; none of the original physical tests validates the new driver. Follow the current deployment acceptance procedure.
 
 This file records the dead ends so future deployments do not repeat them.
 

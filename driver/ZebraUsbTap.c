@@ -10,6 +10,9 @@ static WDFWAITLOCK gDeviceLock;
 static WDFDEVICE gControlDevice;
 static ULONG gDeviceCount;
 static LONG gQueuedBytes;
+static LONG gReservedBytes;
+static ULONGLONG gCaptureGeneration;
+static BOOLEAN gAcceptingCapture;
 static ULONGLONG gNextSequence;
 static ULONGLONG gSession;
 static ULONGLONG gDroppedChunks;
@@ -87,23 +90,48 @@ static VOID RecordDrop(ULONG Length)
 static VOID QueueCaptureChunk(ULONG TargetId, _In_reads_bytes_(Length) const UCHAR* Buffer, ULONG Length)
 {
     PCAPTURE_NODE node;
+    ULONGLONG generation;
+    ULONGLONG stamp;
+    LARGE_INTEGER utc;
     if (!TargetId || !Buffer || !Length || Length > CAPTURE_CHUNK_MAX) {
         RecordDrop(Length);
         return;
     }
+    /* Reserve before allocating or copying so saturation remains cheap and
+       concurrent allocations cannot exceed the nonpaged capture budget. */
+    WdfSpinLockAcquire(gCaptureLock);
+    if (!gAcceptingCapture || gQueuedBytes + gReservedBytes + (LONG)Length > MAX_QUEUED_BYTES) {
+        gDroppedChunks++;
+        gDroppedBytes += Length;
+        WdfSpinLockRelease(gCaptureLock);
+        return;
+    }
+    generation = gCaptureGeneration;
+    gReservedBytes += (LONG)Length;
+    WdfSpinLockRelease(gCaptureLock);
+
+    stamp = KeQueryInterruptTime();
+    KeQuerySystemTimePrecise(&utc);
     node = (PCAPTURE_NODE)ExAllocatePool2(POOL_FLAG_NON_PAGED,
         FIELD_OFFSET(CAPTURE_NODE, Data) + Length, 'pUZT');
     if (!node) {
-        RecordDrop(Length);
+        WdfSpinLockAcquire(gCaptureLock);
+        gReservedBytes -= (LONG)Length;
+        gDroppedChunks++;
+        gDroppedBytes += Length;
+        WdfSpinLockRelease(gCaptureLock);
         return;
     }
     node->References = 1; /* owned by queue */
     node->TargetId = TargetId;
     node->Length = Length;
-    node->Stamp = KeQueryInterruptTime();
+    node->Stamp = stamp;
+    node->ObservedUtc = (ULONGLONG)utc.QuadPart;
     RtlCopyMemory(node->Data, Buffer, Length);
     WdfSpinLockAcquire(gCaptureLock);
-    if (gQueuedBytes + (LONG)Length > MAX_QUEUED_BYTES) {
+    gReservedBytes -= (LONG)Length;
+    /* The last device may have been removed while the copy was in flight. */
+    if (!gAcceptingCapture || generation != gCaptureGeneration) {
         gDroppedChunks++;
         gDroppedBytes += Length;
         WdfSpinLockRelease(gCaptureLock);
@@ -111,6 +139,8 @@ static VOID QueueCaptureChunk(ULONG TargetId, _In_reads_bytes_(Length) const UCH
         return;
     }
     node->Sequence = ++gNextSequence;
+    node->DroppedChunks = gDroppedChunks;
+    node->DroppedBytes = gDroppedBytes;
     InsertTailList(&gCaptureList, &node->Link);
     gQueuedBytes += (LONG)Length;
     WdfSpinLockRelease(gCaptureLock);
@@ -196,6 +226,12 @@ NTSTATUS ZebraEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     DeviceGetContext(device)->TargetId = targetId;
     WdfWaitLockAcquire(gDeviceLock, NULL);
     DeviceGetContext(device)->Counted = TRUE;
+    if (gDeviceCount == 0) {
+        WdfSpinLockAcquire(gCaptureLock);
+        gCaptureGeneration++;
+        gAcceptingCapture = TRUE;
+        WdfSpinLockRelease(gCaptureLock);
+    }
     gDeviceCount++;
     if (!gControlDevice) {
         /* Sideband setup failure must not prevent normal printing. */
@@ -211,6 +247,10 @@ VOID ZebraEvtDeviceCleanup(WDFOBJECT Object)
     PCAPTURE_NODE node;
     WdfWaitLockAcquire(gDeviceLock, NULL);
     if (context->Counted && --gDeviceCount == 0) {
+        WdfSpinLockAcquire(gCaptureLock);
+        gAcceptingCapture = FALSE;
+        gCaptureGeneration++;
+        WdfSpinLockRelease(gCaptureLock);
         if (gControlDevice) {
             WdfObjectDelete(gControlDevice);
             gControlDevice = NULL;
@@ -266,19 +306,19 @@ VOID ZebraEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request,
     UNREFERENCED_PARAMETER(InputBufferLength);
 
     if (IoControlCode == IOCTL_ZEBRAUSBTAP_STATS) {
-        PCAPTURE_STATS_V2 out;
+        PCAPTURE_STATS_V3 out;
         status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*out), (PVOID*)&out, &actual);
         if (!NT_SUCCESS(status)) { WdfRequestComplete(Request, status); return; }
         WdfSpinLockAcquire(gCaptureLock);
         out->Version = ZEBRA_PROTOCOL_VERSION; out->Reserved = 0; out->Session = gSession;
-        out->QueuedBytes = (ULONGLONG)gQueuedBytes;
+        out->QueuedBytes = (ULONGLONG)(gQueuedBytes + gReservedBytes);
         out->DroppedChunks = gDroppedChunks; out->DroppedBytes = gDroppedBytes;
         WdfSpinLockRelease(gCaptureLock);
         WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(*out));
         return;
     }
     if (IoControlCode == IOCTL_ZEBRAUSBTAP_PEEK) {
-        PCAPTURE_OUTPUT_V2 out;
+        PCAPTURE_OUTPUT_V3 out;
         size_t needed;
         WdfSpinLockAcquire(gCaptureLock);
         if (!IsListEmpty(&gCaptureList)) {
@@ -287,12 +327,14 @@ VOID ZebraEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request,
         }
         WdfSpinLockRelease(gCaptureLock);
         if (!node) { WdfRequestComplete(Request, STATUS_NO_MORE_ENTRIES); return; }
-        needed = FIELD_OFFSET(CAPTURE_OUTPUT_V2, Data) + node->Length;
+        needed = FIELD_OFFSET(CAPTURE_OUTPUT_V3, Data) + node->Length;
         status = WdfRequestRetrieveOutputBuffer(Request, needed, (PVOID*)&out, &actual);
         if (NT_SUCCESS(status)) {
             out->Version = ZEBRA_PROTOCOL_VERSION; out->TargetId = node->TargetId;
             out->Length = node->Length; out->Reserved = 0;
             out->Sequence = node->Sequence; out->Session = gSession; out->Stamp = node->Stamp;
+            out->ObservedUtc = node->ObservedUtc;
+            out->DroppedChunks = node->DroppedChunks; out->DroppedBytes = node->DroppedBytes;
             RtlCopyMemory(out->Data, node->Data, node->Length);
             WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, needed);
         } else WdfRequestComplete(Request, status);
@@ -300,7 +342,7 @@ VOID ZebraEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request,
         return;
     }
     if (IoControlCode == IOCTL_ZEBRAUSBTAP_ACK) {
-        PCAPTURE_ACK_V2 ack;
+        PCAPTURE_ACK_V3 ack;
         status = WdfRequestRetrieveInputBuffer(Request, sizeof(*ack), (PVOID*)&ack, &actual);
         if (!NT_SUCCESS(status)) { WdfRequestComplete(Request, status); return; }
         WdfSpinLockAcquire(gCaptureLock);

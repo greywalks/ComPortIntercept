@@ -10,13 +10,13 @@ Open Administrator PowerShell:
 .\driver\Uninstall-Driver.ps1
 ```
 
-If automatic OEM INF discovery fails, use the published name shown during install:
+If automatic OEM INF discovery is ambiguous, inspect `Get-WindowsDriver -Online` and use the matching published name shown during install:
 
 ```powershell
 .\driver\Uninstall-Driver.ps1 -PublishedName oemNN.inf
 ```
 
-The script removes the extension package and restarts matching Zebra physical USB devices.
+The script verifies the name against the current driver-store package identity before removal, then restarts matching Zebra physical USB devices. A saved or supplied OEM name alone is not sufficient; if identity cannot be verified, investigate before removing anything.
 
 ## Confirm the filter is detached
 

@@ -24,7 +24,7 @@
 <section>
 <input id="q" placeholder="Search captured label text, queue, port, or origin">
 <table>
-<thead><tr><th>Time</th><th>Printer</th><th>Origin</th><th>Bytes</th><th>Text</th></tr></thead>
+<thead><tr><th>Time</th><th>Printer</th><th>Origin</th><th>Integrity</th><th>Bytes</th><th>Text</th></tr></thead>
 <tbody id="rows"></tbody>
 </table>
 </section>
@@ -34,7 +34,9 @@
 <p class="muted">USB capture records are stream segments. They do not prove a complete Windows print job or physical delivery.</p>
 <p><button id="reprint" disabled>Reprint Captured Segment</button> <button id="preview-button" disabled>Preview</button></p>
 <div id="msg"></div>
+<div id="preview-meta" class="muted"></div>
 <div id="preview"></div>
+<div id="preview-controls" hidden><button id="preview-prev">Previous label</button> <button id="preview-next">Next label</button></div>
 <h3>Captured Data</h3>
 <pre id="raw"></pre>
 </section>

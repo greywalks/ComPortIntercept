@@ -2,9 +2,9 @@
 
 ## Before starting
 
-This protocol-v2 driver and service must be installed together. Do not infer production readiness from compilation or mock tests. Use a designated Windows 10 2004+ x64 test machine first; ensure the printer queues already print, use an appropriately signed package, and have a recovery plan and BitLocker recovery material available. Install the application and Python in locations writable only by administrators/SYSTEM, especially for the SYSTEM startup task.
+This protocol-v3 driver and service must be installed together. Do not infer production readiness from compilation or mock tests. Use a designated Windows 10 2004+ x64 test machine first; ensure the printer queues already print, use an appropriately signed package, and have a recovery plan and BitLocker recovery material available. Install the application and Python in locations writable only by administrators/SYSTEM, especially for the SYSTEM startup task.
 
-Back up the entire `data/` directory with the service stopped. Preserve the old driver package and application version for rollback. Stopping a service or unloading the driver may discard in-memory, unacknowledged traffic: schedule the upgrade when printers are idle and make this limitation clear to operators.
+Back up the entire `data/` directory and its ACLs with the service stopped. At startup v3 resets ACLs on existing archive data to Administrators/SYSTEM, rejects links and hard-linked files, and fails closed if protection cannot be applied. This can remove previous user/service access and take time on large archives. Preserve the old driver package and application version for rollback. Stopping a service or unloading the driver may discard in-memory, unacknowledged traffic: schedule the upgrade when printers are idle and make this limitation clear to operators.
 
 ## Build and sign
 
@@ -13,7 +13,7 @@ In an elevated PowerShell:
 ```powershell
 .\tools\Discover-ZebraTargets.ps1
 .\driver\Build-Driver.ps1
-Get-AuthenticodeSignature .\driver\x64\Debug\ZebraUsbTap.sys
+Get-AuthenticodeSignature .\driver\x64\Debug\ZebraUsbTap\ZebraUsbTap.sys
 Get-AuthenticodeSignature .\driver\x64\Debug\ZebraUsbTap\zebrausbtap.cat
 ```
 
@@ -28,8 +28,8 @@ Sign using an approved production or development method before installing. A val
 5. Keep the archive server **off**. Print one normal label to each printer and confirm both print. If either fails, roll back immediately.
 6. Start `.\install\Start-Archive.ps1` as administrator. Open `http://127.0.0.1:8765`. Retrieve the token with `Get-Content .\data\private\api-token` in an elevated PowerShell and unlock the UI.
 7. For each printer, print a label, confirm physical output and a new segment for the expected target, then inspect bytes and the capture status. No known dropped chunks or unexpected restart/loss events should be present. Check that unplug/replug and service restart work as expected on the test system.
-8. Reprint a known segment and confirm physical output. The success message only confirms spooler submission. Verify the captured reprint is labeled `Possible Reprint` when it can be matched, understanding that correlation is heuristic.
-9. Test a non-ZPL payload, a split-write label, two labels close together, a restart with queued data, and simulated storage exhaustion. Confirm warnings and recovery. Where possible use Driver Verifier on a disposable test system and test multiple print sizes and sustained load.
+8. Confirm observed timestamps are plausible; older records without source timestamps are labeled archive-time. Enable previews only if appropriate, verify navigation for a multi-label segment, and note that reprint sends all bytes. Reprint a known segment and confirm physical output. The success message only confirms spooler submission. Verify the captured reprint is labeled `Possible Reprint` when it can be matched, understanding that correlation is heuristic.
+9. Test a non-ZPL payload containing NUL, a split-write label, two labels close together, a restart with queued data, reported capture loss and explicit reprint acknowledgment, and simulated storage exhaustion. Confirm warnings and recovery. Where possible use Driver Verifier on a disposable test system and test multiple print sizes and sustained load.
 10. Only after successful acceptance, install the optional startup task. Verify its `ExecutionTimeLimit` is unlimited (`PT0S`), its account and folder permissions are appropriate, and it restarts after a process failure.
 
 Authenticated status example:
