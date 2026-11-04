@@ -8,7 +8,7 @@ Windows software for observing outbound writes to two Zebra USB printer devices,
 
 The filter observes USB-stack write requests. It does **not** see reliable Windows spooler-job boundaries or prove that a lower driver or physical printer completed a write. The server groups bytes by printer, capture time and configured size into **stream segments**. A segment may contain part of a job or multiple jobs. Reprinting sends the exact bytes of that segment to the spooler; it is not proof of an exact original job or successful physical output.
 
-Raw chunks are committed to SQLite before the driver is asked to discard them. Pending chunks are recovered after a user-mode restart. The driver keeps at most 16 MiB in memory; allocation failures, unmappable requests and overflow are counted and displayed when the service reconnects. A machine crash, driver unload, unplug, or loss while neither the service nor driver is active can still lose in-memory data. The status page reports known drops and driver restarts, but cannot prove there were no unobserved losses.
+Raw chunks are committed to SQLite before the driver is asked to discard them. Pending chunks are recovered after a user-mode restart. The driver keeps at most 16 MiB in memory; allocation failures, unmappable requests and overflow are counted and displayed when the service reconnects. A machine crash, driver unload, unplug, or loss while neither the service nor driver is active can still lose in-memory data. The status page reports known drops and driver restarts, but cannot prove there were no unobserved losses. If a driver session reports loss, every record from that session is conservatively flagged and reprinting it requires an explicit acknowledgment. This can flag records that were not actually damaged.
 
 ## Target printers and prerequisites
 
@@ -25,7 +25,7 @@ Raw chunks are committed to SQLite before the driver is asked to discard them. P
 
 ## Deployment overview
 
-Back up `data/` and confirm both printers work before making changes. Stop the old archive service, then install the driver and service from the **same version**: protocol v2 intentionally rejects the old driver. A driver update affects printer stacks and requires signing and staged testing.
+Back up `data/` and confirm both printers work before making changes. Stop the old archive service, then install the driver and service from the **same version**: protocol v3 intentionally rejects older drivers. A driver update affects printer stacks and requires signing and staged testing.
 
 From an elevated PowerShell in the protected installation folder:
 
@@ -51,17 +51,19 @@ Get-Content .\data\private\api-token
 
 Treat the token as a password. It is created locally and the Windows ACL is restricted to Administrators and SYSTEM. It is not stored in this repository. The web server only binds to `127.0.0.1`; the API requires the token and validates the Host and any Origin header. If startup cannot secure the token, it fails instead of exposing the API. To rotate it, stop the service, delete the token as an administrator, and restart.
 
-Print a test label to each printer and verify physical output, a new record, expected target, sensible byte content, and zero unexpected drop counters. Test a known captured segment using **Reprint Captured Segment**, then verify physical output separately. A `Possible Reprint` record is a time-and-hash match, not certain provenance. If a print or its audit update reports an uncertain outcome, check the physical printer before retrying.
+Print a test label to each printer and verify physical output, a new record, expected target, observation timestamp, sensible byte content, and zero unexpected drop counters. Test a known captured segment using **Reprint Captured Segment**, then verify physical output separately. A `Possible Reprint` record is a time-and-hash match, not certain provenance. If a print or its audit update reports an uncertain outcome, check the physical printer before retrying.
 
 Follow [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the complete upgrade, testing and rollback sequence. The optional startup task uses an unlimited execution time and can be installed with `.\install\Install-StartupTask.ps1`; `-Mode System` requires the protected installation described above.
 
 ## Privacy and diagnostics
 
-Labelary previews are **disabled by default**. To enable them, set `preview_provider` to `labelary` in `config.json` and restart. The UI then asks before sending the selected segment to Labelary over HTTPS. Do not enable it for sensitive labels unless that external transfer is approved.
+Labelary previews are **disabled by default**. To enable them, set `preview_provider` to `labelary` in `config.json` and restart. The UI then asks before sending the selected segment to Labelary over HTTPS and lets you navigate the labels it reports. Reprinting still sends the whole segment. Do not enable it for sensitive labels unless that external transfer is approved.
 
 The test-ingest API is disabled by default. To run its optional diagnostic, set `enable_test_ingest` to `true`, restart, and run `.\tools\Test-ArchiveApi.ps1` elevated. Test records have an isolated path and never enter the live stream assembler. Disable it again after testing. The diagnostic does not verify the driver or a printer.
 
-`data/` contains the database, raw label bytes and access token; protect and back it up according to the sensitivity of the labels. `data/private/` is ignored by Git.
+`data/` contains the database, raw label bytes and access token. At startup the application restricts the archive tree to Administrators and SYSTEM on Windows, including existing files. This changes existing ACLs and can remove access for other users or services; back up both data and permissions before upgrading. Startup rejects links, junctions, reparse points, and hard-linked files in the data tree, and fails if protection cannot be applied. Large archives can take longer to start. The installation directory and Python executable must also be protected. `data/private/` is ignored by Git.
+
+Protocol-v3 records carry the driver's UTC observation time and a separate archive time. Older records are labeled with archive time because their original observation time is unavailable. When the driver is unavailable after a service restart, pending chunks remain durable and are displayed in status until they can be reconciled.
 
 ## Testing
 

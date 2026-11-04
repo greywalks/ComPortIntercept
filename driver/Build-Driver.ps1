@@ -28,7 +28,7 @@ Write-Host 'Building Debug|x64...' -ForegroundColor Cyan
 & $msbuild $sln /t:Rebuild /p:Configuration=Debug /p:Platform=x64 /p:WindowsTargetPlatformVersion=$sdk /m
 if ($LASTEXITCODE -ne 0) { throw "Driver build failed with exit code $LASTEXITCODE" }
 
-$sys = Join-Path $driverDir 'x64\Debug\ZebraUsbTap.sys'
+$sys = Join-Path $driverDir 'x64\Debug\ZebraUsbTap\ZebraUsbTap.sys'
 $inf = Join-Path $driverDir 'x64\Debug\ZebraUsbTap\ZebraUsbTap.inf'
 $cat = Join-Path $driverDir 'x64\Debug\ZebraUsbTap\zebrausbtap.cat'
 foreach ($p in @($sys,$inf,$cat)) {

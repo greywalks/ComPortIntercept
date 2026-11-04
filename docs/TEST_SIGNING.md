@@ -17,7 +17,7 @@ Microsoft documentation:
 After building, verify both the SYS and CAT:
 
 ```powershell
-Get-AuthenticodeSignature .\driver\x64\Debug\ZebraUsbTap.sys
+Get-AuthenticodeSignature .\driver\x64\Debug\ZebraUsbTap\ZebraUsbTap.sys
 Get-AuthenticodeSignature .\driver\x64\Debug\ZebraUsbTap\zebrausbtap.cat
 ```
 

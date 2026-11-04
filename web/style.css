@@ -1,3 +1,4 @@
+[hidden]{display:none!important}
 body{font-family:Segoe UI,Arial,sans-serif;margin:0;background:#f4f6f8;color:#172033}
 header{padding:18px 24px;background:#172033;color:#fff;display:flex;justify-content:space-between;align-items:center}
 .subtitle{font-size:13px;opacity:.8}.notice{margin:16px 20px;padding:14px;background:white;border-radius:8px}.warning{background:#fff3cd;color:#603d00}

@@ -8,7 +8,7 @@ Class=Extension
 ClassGuid={e2f84ce7-8efa-411c-aa69-97454ca4cb57}
 ExtensionId={C7F98C91-01C5-4C69-97D5-28C6D6E59B48}
 Provider=%ProviderName%
-DriverVer=11/04/2026,1.1.0.0
+DriverVer=11/04/2026,1.2.0.0
 CatalogFile=ZebraUsbTap.cat
 PnpLockdown=1
 

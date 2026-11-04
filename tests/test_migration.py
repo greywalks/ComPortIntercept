@@ -9,7 +9,7 @@ class MigrationTests(unittest.TestCase):
     def test_legacy_archive_remains_readable_and_flagged_unverified(self):
         with tempfile.TemporaryDirectory() as root:
             d = Path(root); (d/'jobs').mkdir()
-            raw = b'^XA^FDold^FS^XZ'; (d/'jobs'/'0000000001.bin').write_bytes(raw)
+            raw = b'\0^XA^FDold^FS^XZ'; (d/'jobs'/'0000000001.bin').write_bytes(raw)
             c = sqlite3.connect(d/'archive.db')
             c.executescript('''CREATE TABLE jobs(id INTEGER PRIMARY KEY AUTOINCREMENT, captured_at TEXT NOT NULL,
                 target_id INTEGER NOT NULL,printer_name TEXT NOT NULL,windows_port TEXT NOT NULL,byte_count INTEGER NOT NULL,
@@ -23,6 +23,9 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual(archive.read_raw(job), raw)
             self.assertEqual(job['integrity'], 'legacy-unverified')
             self.assertEqual(job['boundary_reason'], 'legacy')
+            self.assertEqual(job['time_quality'], 'archive-time')
+            self.assertEqual(job['archived_at'], '2026-01-01')
+            self.assertEqual(archive.list_jobs('old')[0]['id'], 1)
             self.assertEqual(len(archive.list_jobs()), 1)
 
 if __name__ == '__main__': unittest.main()

@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.2.0 - 2026-11-04 (physical acceptance pending)
+
+- Preserve pending chunks across restarts and join them with queued continuations from the same driver session.
+- Mark all records from a session with known capture loss and require an audited reprint acknowledgment.
+- Add driver UTC observation timestamps, retain archive timestamps, and identify legacy records accurately.
+- Show offline status reliably, support navigation through multi-label previews, and warn that reprinting sends the whole segment.
+- Project history snippets in SQLite and normalize NULs in searchable text without altering raw files.
+- Restrict existing and future archive data to Administrators/SYSTEM, rejecting links and hard links.
+- Verify the packaged SYS and driver-store identity before removal, and fail on device restart errors.
+- Reserve driver queue capacity before allocating and copying, including in-flight reservations.
+- Require the matching protocol-v3 driver and service; physical testing and signing are still required.
+
 ## 1.1.0 - 2026-11-04 (proposed; physical acceptance pending)
 
 - Replace destructive driver reads with a versioned peek/persist/ack protocol, bounded queue loss counters and session tracking.

@@ -5,12 +5,12 @@
 
 #define ZEBRA_TARGET_GK420D 1
 #define ZEBRA_TARGET_ZP500  2
-#define ZEBRA_PROTOCOL_VERSION 2
+#define ZEBRA_PROTOCOL_VERSION 3
 
-/* V2 keeps a chunk until a single authenticated consumer acknowledges it. */
-#define IOCTL_ZEBRAUSBTAP_PEEK CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_READ_DATA)
-#define IOCTL_ZEBRAUSBTAP_ACK CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_READ_DATA)
-#define IOCTL_ZEBRAUSBTAP_STATS CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_READ_DATA)
+/* V3 keeps a chunk until a single authenticated consumer acknowledges it. */
+#define IOCTL_ZEBRAUSBTAP_PEEK CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_READ_DATA)
+#define IOCTL_ZEBRAUSBTAP_ACK CTL_CODE(FILE_DEVICE_UNKNOWN, 0x806, METHOD_BUFFERED, FILE_READ_DATA)
+#define IOCTL_ZEBRAUSBTAP_STATS CTL_CODE(FILE_DEVICE_UNKNOWN, 0x807, METHOD_BUFFERED, FILE_READ_DATA)
 
 typedef struct _DEVICE_CONTEXT {
     ULONG TargetId;
@@ -24,11 +24,14 @@ typedef struct _CAPTURE_NODE {
     ULONG TargetId;
     ULONG Length;
     ULONGLONG Stamp;
+    ULONGLONG ObservedUtc;
     ULONGLONG Sequence;
+    ULONGLONG DroppedChunks;
+    ULONGLONG DroppedBytes;
     UCHAR Data[1];
 } CAPTURE_NODE, *PCAPTURE_NODE;
 
-typedef struct _CAPTURE_OUTPUT_V2 {
+typedef struct _CAPTURE_OUTPUT_V3 {
     ULONG Version;
     ULONG TargetId;
     ULONG Length;
@@ -36,29 +39,32 @@ typedef struct _CAPTURE_OUTPUT_V2 {
     ULONGLONG Sequence;
     ULONGLONG Session;
     ULONGLONG Stamp;
+    ULONGLONG ObservedUtc;
+    ULONGLONG DroppedChunks;
+    ULONGLONG DroppedBytes;
     UCHAR Data[1];
-} CAPTURE_OUTPUT_V2, *PCAPTURE_OUTPUT_V2;
+} CAPTURE_OUTPUT_V3, *PCAPTURE_OUTPUT_V3;
 
-typedef struct _CAPTURE_ACK_V2 {
+typedef struct _CAPTURE_ACK_V3 {
     ULONGLONG Session;
     ULONGLONG Sequence;
-} CAPTURE_ACK_V2, *PCAPTURE_ACK_V2;
+} CAPTURE_ACK_V3, *PCAPTURE_ACK_V3;
 
-typedef struct _CAPTURE_STATS_V2 {
+typedef struct _CAPTURE_STATS_V3 {
     ULONG Version;
     ULONG Reserved;
     ULONGLONG Session;
     ULONGLONG QueuedBytes;
     ULONGLONG DroppedChunks;
     ULONGLONG DroppedBytes;
-} CAPTURE_STATS_V2, *PCAPTURE_STATS_V2;
+} CAPTURE_STATS_V3, *PCAPTURE_STATS_V3;
 
 /* Keep the wire layout and CTL_CODE values in sync with server/app.py. */
-C_ASSERT(FIELD_OFFSET(CAPTURE_OUTPUT_V2, Data) == 40 &&
-         sizeof(CAPTURE_ACK_V2) == 16 && sizeof(CAPTURE_STATS_V2) == 40 &&
-         IOCTL_ZEBRAUSBTAP_PEEK == 0x226008 &&
-         IOCTL_ZEBRAUSBTAP_ACK == 0x22600C &&
-         IOCTL_ZEBRAUSBTAP_STATS == 0x226010);
+C_ASSERT(FIELD_OFFSET(CAPTURE_OUTPUT_V3, Data) == 64 &&
+         sizeof(CAPTURE_ACK_V3) == 16 && sizeof(CAPTURE_STATS_V3) == 40 &&
+         IOCTL_ZEBRAUSBTAP_PEEK == 0x226014 &&
+         IOCTL_ZEBRAUSBTAP_ACK == 0x226018 &&
+         IOCTL_ZEBRAUSBTAP_STATS == 0x22601C);
 
 DRIVER_INITIALIZE DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD ZebraEvtDeviceAdd;
