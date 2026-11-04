@@ -1,0 +1,33 @@
+{
+  "listen_host": "127.0.0.1",
+  "listen_port": 8765,
+  "capture_device": "\\\\.\\ZebraUsbTap",
+  "capture_enabled": true,
+  "standalone_flush_ms": 400,
+  "preview_provider": "labelary",
+  "labelary_url": "https://api.labelary.com",
+  "printers": [
+    {
+      "id": "gk420d-usb002",
+      "target_id": 1,
+      "name": "ZDesigner GK420d",
+      "windows_port": "USB002",
+      "hardware_id": "USB\\VID_0A5F&PID_0080",
+      "usbprint_hardware_id": "USBPRINT\\Zebra_TechnologiesZT9BEC",
+      "label_dpmm": 8,
+      "label_width_in": 4,
+      "label_height_in": 6
+    },
+    {
+      "id": "zp500-usb007",
+      "target_id": 2,
+      "name": "Zebra ZP 500 (ZPL)",
+      "windows_port": "USB007",
+      "hardware_id": "USB\\VID_0A5F&PID_0062",
+      "usbprint_hardware_id": "USBPRINT\\Zebra_TechnologiesZT7D5C",
+      "label_dpmm": 8,
+      "label_width_in": 4,
+      "label_height_in": 6
+    }
+  ]
+}
