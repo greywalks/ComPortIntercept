@@ -191,7 +191,7 @@ class Archive:
                       chunks[0][0] if chunks else None, chunks[0][1] if chunks else None, chunks[-1][1] if chunks else None))
                     job_id = int(cur.lastrowid)
                     for session, seq in chunks:
-                        changed = c.execute("UPDATE capture_chunks SET job_id=? WHERE session=? AND seq=? AND job_id IS NULL",
+                        changed = c.execute("UPDATE capture_chunks SET job_id=?,data=X'' WHERE session=? AND seq=? AND job_id IS NULL",
                                             (job_id, str(session), int(seq))).rowcount
                         if changed != 1:
                             raise RuntimeError("Capture chunk was already committed or is missing")

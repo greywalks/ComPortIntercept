@@ -37,6 +37,11 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(row['integrity'], 'unverified-stream')
         self.assertEqual(row['boundary_reason'], 'idle')
         self.assertEqual(len(self.archive.pending_chunks()), 0)
+        c = self.archive.connect()
+        try:
+            self.assertEqual(c.execute('SELECT count(*) FROM capture_chunks WHERE length(data) > 0').fetchone()[0], 0)
+        finally:
+            c.close()
 
     def test_non_zpl_flushes_after_idle_and_targets_are_isolated(self):
         self.add(1, b'RAW-ONE', target=1)

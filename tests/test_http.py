@@ -86,7 +86,7 @@ class TokenTests(unittest.TestCase):
             self.assertEqual(token, secure_token(root))
             path = Path(root) / 'private' / 'api-token'
             script = Path(root) / 'acl-check.ps1'
-            script.write_text("(Get-Acl -LiteralPath $args[0]).Access | ForEach-Object { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value + ':' + $_.IsInherited }", encoding='utf-8')
+            script.write_text("([System.IO.File]::GetAccessControl($args[0])).Access | ForEach-Object { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value + ':' + $_.IsInherited }", encoding='utf-8')
             output = subprocess.check_output(['powershell.exe', '-NoProfile', '-File', str(script), str(path)], text=True)
             self.assertEqual(set(output.splitlines()), {'S-1-5-18:False', 'S-1-5-32-544:False'})
 
