@@ -1,174 +1,46 @@
-# Repeatable deployment procedure
+# Deployment, acceptance and rollback
 
-This is the deployment path to use on a fresh workstation. Do not replay the historical STEP1-STEP6 repair scripts.
+## Before starting
 
-## Prerequisites
+This protocol-v2 driver and service must be installed together. Do not infer production readiness from compilation or mock tests. Use a designated Windows 10 2004+ x64 test machine first; ensure the printer queues already print, use an appropriately signed package, and have a recovery plan and BitLocker recovery material available. Install the application and Python in locations writable only by administrators/SYSTEM, especially for the SYSTEM startup task.
 
-- Windows 10 version 1903 or later, x64.
-- Administrator rights.
-- The target Zebra queues installed and printing normally before adding the filter.
-- Python 3.x.
-- Visual Studio 2022 with **Desktop development with C++**.
-- Windows SDK + WDK with VS/MSBuild integration.
-- A valid driver-signing method appropriate for the environment.
+Back up the entire `data/` directory with the service stopped. Preserve the old driver package and application version for rollback. Stopping a service or unloading the driver may discard in-memory, unacknowledged traffic: schedule the upgrade when printers are idle and make this limitation clear to operators.
 
-Before doing anything with boot security on a BitLocker-protected machine, make sure the recovery process is understood and recovery material is available.
+## Build and sign
 
-## A. Baseline the workstation
+In an elevated PowerShell:
 
 ```powershell
-Get-Printer | Where-Object { $_.Name -match 'Zebra|ZDesigner' } |
-    Format-Table Name,DriverName,PortName -AutoSize
-
 .\tools\Discover-ZebraTargets.ps1
-```
-
-Expected model hardware IDs:
-
-```text
-USB\VID_0A5F&PID_0080   GK420d
-USB\VID_0A5F&PID_0062   ZP 500
-```
-
-Confirm normal printing works **before** installing the filter.
-
-## B. Build
-
-```powershell
 .\driver\Build-Driver.ps1
-```
-
-Expected package output:
-
-```text
-driver\x64\Debug\ZebraUsbTap.sys
-driver\x64\Debug\ZebraUsbTap\ZebraUsbTap.inf
-driver\x64\Debug\ZebraUsbTap\zebrausbtap.cat
-```
-
-Verify signatures:
-
-```powershell
 Get-AuthenticodeSignature .\driver\x64\Debug\ZebraUsbTap.sys
 Get-AuthenticodeSignature .\driver\x64\Debug\ZebraUsbTap\zebrausbtap.cat
 ```
 
-A valid Authenticode result does not by itself guarantee that the Windows kernel will accept a development/test certificate. See `TEST_SIGNING.md`.
+Sign using an approved production or development method before installing. A valid Authenticode signature alone does not establish that Windows kernel policy accepts it. Do not disable boot security casually; see [TEST_SIGNING.md](TEST_SIGNING.md).
 
-## C. Install
+## Upgrade or install
 
-```powershell
-.\driver\Install-Driver.ps1
-```
+1. Stop the archive and its scheduled task; make sure printers are idle.
+2. If replacing an existing driver, run `.\driver\Uninstall-Driver.ps1`. Verify the old filter is detached. If the old service/image remains resident, reboot before installing the new package. The new driver implements last-device control-object cleanup, but this still requires on-machine verification.
+3. Install the appropriately signed package: `.\driver\Install-Driver.ps1`.
+4. Run `.\tools\Verify-Deployment.ps1`. Confirm the expected filter is attached to both physical devices and the driver service is running. Resolve signature error 577 rather than repeatedly reinstalling.
+5. Keep the archive server **off**. Print one normal label to each printer and confirm both print. If either fails, roll back immediately.
+6. Start `.\install\Start-Archive.ps1` as administrator. Open `http://127.0.0.1:8765`. Retrieve the token with `Get-Content .\data\private\api-token` in an elevated PowerShell and unlock the UI.
+7. For each printer, print a label, confirm physical output and a new segment for the expected target, then inspect bytes and the capture status. No known dropped chunks or unexpected restart/loss events should be present. Check that unplug/replug and service restart work as expected on the test system.
+8. Reprint a known segment and confirm physical output. The success message only confirms spooler submission. Verify the captured reprint is labeled `Possible Reprint` when it can be matched, understanding that correlation is heuristic.
+9. Test a non-ZPL payload, a split-write label, two labels close together, a restart with queued data, and simulated storage exhaustion. Confirm warnings and recovery. Where possible use Driver Verifier on a disposable test system and test multiple print sizes and sustained load.
+10. Only after successful acceptance, install the optional startup task. Verify its `ExecutionTimeLimit` is unlimited (`PT0S`), its account and folder permissions are appropriate, and it restarts after a process failure.
 
-The installer records the `oemNN.inf` published name under `.local\published-inf.txt` when it can parse it.
-
-Verify:
-
-```powershell
-.\tools\Verify-Deployment.ps1
-```
-
-Required conditions:
-
-- each physical Zebra USB device lists `ZebraUsbTap` in `DEVPKEY_Device_CompoundUpperFilters`;
-- `sc.exe query ZebraUsbTap` reports `STATE : 4 RUNNING`.
-
-If the service is stopped, try:
+Authenticated status example:
 
 ```powershell
-sc.exe start ZebraUsbTap
+$token = (Get-Content .\data\private\api-token -Raw).Trim()
+Invoke-RestMethod http://127.0.0.1:8765/api/status -Headers @{Authorization="Bearer $token"} | ConvertTo-Json -Depth 6
 ```
 
-Error **577** means the kernel rejected the package signature under the current boot policy. Do not rebuild or reinstall repeatedly; resolve signing policy instead.
+Never interpret a green connection indicator as proof that every label was captured or physically printed. Review `dropped_chunks`, `loss_events`, and `driver_restarts`.
 
-## D. Pass-through acceptance test
+## Rollback
 
-Keep `server/app.py` stopped.
-
-Print exactly one normal GK420d label. It must physically print.
-
-Then print exactly one normal ZP 500 label. It must physically print.
-
-If either fails, rollback immediately:
-
-```powershell
-.\driver\Uninstall-Driver.ps1
-```
-
-Do not continue to archive testing until ordinary printing works with the filter loaded.
-
-## E. Archive-server acceptance test
-
-Start:
-
-```powershell
-.\install\Start-Archive.ps1
-```
-
-Check:
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:8765/api/status | ConvertTo-Json -Depth 6
-```
-
-`capture_connected` must be `true`.
-
-The following command verifies only the user-mode archive/database path:
-
-```powershell
-.\tools\Test-ArchiveApi.ps1
-```
-
-It does **not** prove kernel capture.
-
-Now print one real label to each printer. For each print, verify:
-
-1. physical output succeeds;
-2. `last_capture_at` changes;
-3. a new history entry appears;
-4. the record has the correct printer/target;
-5. raw byte count and displayed ZPL look plausible.
-
-## F. Exact-reprint acceptance test
-
-Choose one captured record and click **Reprint Exact Job**.
-
-Verify:
-
-- the physical printer outputs the label;
-- the original `.bin` is unchanged;
-- the reprint is recorded as an archive reprint if the capture path observes it.
-
-## G. Configure startup
-
-Current-user elevated startup:
-
-```powershell
-.\install\Install-StartupTask.ps1
-```
-
-Machine startup under SYSTEM:
-
-```powershell
-.\install\Install-StartupTask.ps1 -Mode System
-```
-
-Verify the local UI after task startup:
-
-```text
-http://127.0.0.1:8765
-```
-
-## H. Upgrade procedure
-
-When replacing the kernel driver with a new build:
-
-1. stop the archive server;
-2. uninstall the existing OEM package;
-3. run `sc.exe query ZebraUsbTap`;
-4. if the old service/image is still `RUNNING`, reboot before installing the new build;
-5. install the new package;
-6. repeat pass-through and capture acceptance tests.
-
-Never assume that removing an OEM INF unloads a currently resident kernel image.
+If printing is affected, stop submitting jobs and run `.\driver\Uninstall-Driver.ps1`. Confirm the filter is detached and both printers work normally. If necessary reboot to unload the old image. Reinstall a previously accepted driver/service pair only after reviewing its compatibility and known issues. See [RECOVERY.md](RECOVERY.md).

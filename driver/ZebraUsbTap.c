@@ -2,15 +2,20 @@
 
 #define DEVICE_NAME L"\\Device\\ZebraUsbTap"
 #define DOS_NAME    L"\\DosDevices\\ZebraUsbTap"
-
 #define CAPTURE_CHUNK_MAX (1024 * 1024)
 
 static LIST_ENTRY gCaptureList;
 static WDFSPINLOCK gCaptureLock;
-static volatile LONG gQueuedBytes = 0;
+static WDFWAITLOCK gDeviceLock;
+static WDFDEVICE gControlDevice;
+static ULONG gDeviceCount;
+static LONG gQueuedBytes;
+static ULONGLONG gNextSequence;
+static ULONGLONG gSession;
+static ULONGLONG gDroppedChunks;
+static ULONGLONG gDroppedBytes;
 static const LONG MAX_QUEUED_BYTES = 16 * 1024 * 1024;
 
-/* Physical USB device IDs, directly above usbprint.sys. */
 static const WCHAR GK420D_HWID[] = L"USB\\VID_0A5F&PID_0080";
 static const WCHAR ZP500_HWID[]  = L"USB\\VID_0A5F&PID_0062";
 
@@ -62,57 +67,58 @@ static ULONG MatchTargetId(_In_ PWDFDEVICE_INIT DeviceInit)
     return targetId;
 }
 
-/*
- * Capture is deliberately fail-open: allocation/mapping/queue limits can make
- * us skip archive data, but must never fail or modify the actual print IRP.
- */
-static VOID QueueCaptureChunk(
-    ULONG TargetId,
-    _In_reads_bytes_(Length) const UCHAR* Buffer,
-    ULONG Length
-)
+
+static VOID ReleaseCaptureNode(_In_ PCAPTURE_NODE Node)
 {
-    SIZE_T allocSize;
+    if (InterlockedDecrement(&Node->References) == 0) {
+        ExFreePool(Node);
+    }
+}
+
+static VOID RecordDrop(ULONG Length)
+{
+    WdfSpinLockAcquire(gCaptureLock);
+    gDroppedChunks++;
+    gDroppedBytes += Length;
+    WdfSpinLockRelease(gCaptureLock);
+}
+
+/* Failure to capture never changes the original print IRP. */
+static VOID QueueCaptureChunk(ULONG TargetId, _In_reads_bytes_(Length) const UCHAR* Buffer, ULONG Length)
+{
     PCAPTURE_NODE node;
-
-    if (TargetId == 0 || Buffer == NULL || Length == 0 || Length > CAPTURE_CHUNK_MAX) {
+    if (!TargetId || !Buffer || !Length || Length > CAPTURE_CHUNK_MAX) {
+        RecordDrop(Length);
         return;
     }
-
-    allocSize = FIELD_OFFSET(CAPTURE_NODE, Data) + Length;
-    node = (PCAPTURE_NODE)ExAllocatePool2(
-        POOL_FLAG_NON_PAGED,
-        allocSize,
-        'pUZT'
-    );
+    node = (PCAPTURE_NODE)ExAllocatePool2(POOL_FLAG_NON_PAGED,
+        FIELD_OFFSET(CAPTURE_NODE, Data) + Length, 'pUZT');
     if (!node) {
+        RecordDrop(Length);
         return;
     }
-
+    node->References = 1; /* owned by queue */
     node->TargetId = TargetId;
     node->Length = Length;
     node->Stamp = KeQueryInterruptTime();
     RtlCopyMemory(node->Data, Buffer, Length);
-
     WdfSpinLockAcquire(gCaptureLock);
     if (gQueuedBytes + (LONG)Length > MAX_QUEUED_BYTES) {
+        gDroppedChunks++;
+        gDroppedBytes += Length;
         WdfSpinLockRelease(gCaptureLock);
-        ExFreePool(node);
+        ReleaseCaptureNode(node);
         return;
     }
+    node->Sequence = ++gNextSequence;
     InsertTailList(&gCaptureList, &node->Link);
     gQueuedBytes += (LONG)Length;
     WdfSpinLockRelease(gCaptureLock);
 }
 
-static VOID QueueCapture(
-    ULONG TargetId,
-    _In_reads_bytes_(Length) const UCHAR* Buffer,
-    ULONG Length
-)
+static VOID QueueCapture(ULONG TargetId, _In_reads_bytes_(Length) const UCHAR* Buffer, ULONG Length)
 {
     ULONG offset = 0;
-
     while (offset < Length) {
         ULONG remaining = Length - offset;
         ULONG chunk = remaining > CAPTURE_CHUNK_MAX ? CAPTURE_CHUNK_MAX : remaining;
@@ -121,232 +127,196 @@ static VOID QueueCapture(
     }
 }
 
+/* Caller holds gDeviceLock; this device is deleted when the last PnP device is removed. */
 static NTSTATUS CreateControlDevice(WDFDRIVER Driver)
 {
     DECLARE_CONST_UNICODE_STRING(sddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
+    DECLARE_CONST_UNICODE_STRING(devName, DEVICE_NAME);
+    DECLARE_CONST_UNICODE_STRING(dosName, DOS_NAME);
     PWDFDEVICE_INIT init = WdfControlDeviceInitAllocate(Driver, &sddl);
-    WDFDEVICE control;
+    WDFDEVICE control = NULL;
     NTSTATUS status;
     WDF_IO_QUEUE_CONFIG qcfg;
-
-    if (!init) {
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
-    {
-        DECLARE_CONST_UNICODE_STRING(devName, DEVICE_NAME);
-        status = WdfDeviceInitAssignName(init, &devName);
-    }
-    if (!NT_SUCCESS(status)) {
-        WdfDeviceInitFree(init);
-        return status;
-    }
-
+    if (!init) return STATUS_INSUFFICIENT_RESOURCES;
+    WdfDeviceInitSetExclusive(init, TRUE);
+    status = WdfDeviceInitAssignName(init, &devName);
+    if (!NT_SUCCESS(status)) goto Error;
     status = WdfDeviceCreate(&init, WDF_NO_OBJECT_ATTRIBUTES, &control);
-    if (!NT_SUCCESS(status)) {
-        return status;
-    }
-
-    {
-        DECLARE_CONST_UNICODE_STRING(dosName, DOS_NAME);
-        status = WdfDeviceCreateSymbolicLink(control, &dosName);
-    }
-    if (!NT_SUCCESS(status)) {
-        return status;
-    }
-
+    if (!NT_SUCCESS(status)) goto Error;
+    status = WdfDeviceCreateSymbolicLink(control, &dosName);
+    if (!NT_SUCCESS(status)) goto Error;
     WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&qcfg, WdfIoQueueDispatchSequential);
     qcfg.EvtIoDeviceControl = ZebraEvtIoDeviceControl;
     status = WdfIoQueueCreate(control, &qcfg, WDF_NO_OBJECT_ATTRIBUTES, WDF_NO_HANDLE);
-    if (!NT_SUCCESS(status)) {
-        return status;
-    }
-
+    if (!NT_SUCCESS(status)) goto Error;
     WdfControlFinishInitializing(control);
+    gControlDevice = control;
     return STATUS_SUCCESS;
+Error:
+    if (init) WdfDeviceInitFree(init);
+    if (control) WdfObjectDelete(control);
+    return status;
 }
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 {
     WDF_DRIVER_CONFIG config;
     WDFDRIVER driver;
-    NTSTATUS status;
     WDF_OBJECT_ATTRIBUTES attrs;
-
+    NTSTATUS status;
+    LARGE_INTEGER stamp;
     WDF_DRIVER_CONFIG_INIT(&config, ZebraEvtDeviceAdd);
-    status = WdfDriverCreate(
-        DriverObject,
-        RegistryPath,
-        WDF_NO_OBJECT_ATTRIBUTES,
-        &config,
-        &driver
-    );
-    if (!NT_SUCCESS(status)) {
-        return status;
-    }
-
+    status = WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &config, &driver);
+    if (!NT_SUCCESS(status)) return status;
     InitializeListHead(&gCaptureList);
-
+    KeQuerySystemTimePrecise(&stamp);
+    gSession = (ULONGLONG)stamp.QuadPart;
     WDF_OBJECT_ATTRIBUTES_INIT(&attrs);
     attrs.ParentObject = driver;
     status = WdfSpinLockCreate(&attrs, &gCaptureLock);
-    if (!NT_SUCCESS(status)) {
-        return status;
-    }
-
-    return CreateControlDevice(driver);
+    if (!NT_SUCCESS(status)) return status;
+    return WdfWaitLockCreate(&attrs, &gDeviceLock);
 }
 
 NTSTATUS ZebraEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
 {
-    ULONG targetId;
+    ULONG targetId = MatchTargetId(DeviceInit);
     NTSTATUS status;
     WDF_OBJECT_ATTRIBUTES attrs;
     WDFDEVICE device;
-
-    UNREFERENCED_PARAMETER(Driver);
-
-    targetId = MatchTargetId(DeviceInit);
-
-    /*
-     * Mark this as a filter BEFORE WdfDeviceCreate. Requests for which we do
-     * not create an I/O queue are automatically forwarded by KMDF.
-     */
     WdfFdoInitSetFilter(DeviceInit);
-
-    /*
-     * Observe IRP_MJ_WRITE before KMDF dispatches it. We copy the payload and
-     * then return the same IRP to KMDF with WdfDeviceWdmDispatchPreprocessedIrp.
-     * There is intentionally NO EvtIoWrite queue in this version.
-     */
-    status = WdfDeviceInitAssignWdmIrpPreprocessCallback(
-        DeviceInit,
-        ZebraEvtWdmWritePreprocess,
-        IRP_MJ_WRITE,
-        NULL,
-        0
-    );
-    if (!NT_SUCCESS(status)) {
-        return status;
-    }
-
+    status = WdfDeviceInitAssignWdmIrpPreprocessCallback(DeviceInit,
+        ZebraEvtWdmWritePreprocess, IRP_MJ_WRITE, NULL, 0);
+    if (!NT_SUCCESS(status)) return status;
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attrs, DEVICE_CONTEXT);
+    attrs.EvtCleanupCallback = ZebraEvtDeviceCleanup;
+    attrs.ExecutionLevel = WdfExecutionLevelPassive;
     status = WdfDeviceCreate(&DeviceInit, &attrs, &device);
-    if (!NT_SUCCESS(status)) {
-        return status;
-    }
-
+    if (!NT_SUCCESS(status)) return status;
     DeviceGetContext(device)->TargetId = targetId;
-
-    /*
-     * Deliberately no PnP-device I/O queue. After preprocessing, KMDF's filter
-     * pass-through path forwards the unchanged write to usbprint.sys.
-     */
+    WdfWaitLockAcquire(gDeviceLock, NULL);
+    DeviceGetContext(device)->Counted = TRUE;
+    gDeviceCount++;
+    if (!gControlDevice) {
+        /* Sideband setup failure must not prevent normal printing. */
+        (VOID)CreateControlDevice(Driver);
+    }
+    WdfWaitLockRelease(gDeviceLock);
     return STATUS_SUCCESS;
+}
+
+VOID ZebraEvtDeviceCleanup(WDFOBJECT Object)
+{
+    PDEVICE_CONTEXT context = DeviceGetContext((WDFDEVICE)Object);
+    PCAPTURE_NODE node;
+    WdfWaitLockAcquire(gDeviceLock, NULL);
+    if (context->Counted && --gDeviceCount == 0) {
+        if (gControlDevice) {
+            WdfObjectDelete(gControlDevice);
+            gControlDevice = NULL;
+        }
+        /* Last printer is gone; account for and release any unacknowledged data.
+           Readers hold their own references, so an in-flight peek remains safe. */
+        for (;;) {
+            WdfSpinLockAcquire(gCaptureLock);
+            if (IsListEmpty(&gCaptureList)) {
+                WdfSpinLockRelease(gCaptureLock);
+                break;
+            }
+            node = CONTAINING_RECORD(RemoveHeadList(&gCaptureList), CAPTURE_NODE, Link);
+            gQueuedBytes -= (LONG)node->Length;
+            gDroppedChunks++;
+            gDroppedBytes += node->Length;
+            WdfSpinLockRelease(gCaptureLock);
+            ReleaseCaptureNode(node);
+        }
+    }
+    context->Counted = FALSE;
+    WdfWaitLockRelease(gDeviceLock);
 }
 
 NTSTATUS ZebraEvtWdmWritePreprocess(WDFDEVICE Device, PIRP Irp)
 {
     ULONG targetId = DeviceGetContext(Device)->TargetId;
     PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
-    ULONG length = 0;
+    ULONG length = irpSp ? irpSp->Parameters.Write.Length : 0;
     const UCHAR* buffer = NULL;
     PDEVICE_OBJECT wdmDevice;
-
-    if (irpSp != NULL) {
-        length = irpSp->Parameters.Write.Length;
-    }
-
-    if (targetId != 0 && length != 0) {
+    if (length) {
         wdmDevice = WdfDeviceWdmGetDeviceObject(Device);
-
-        if ((wdmDevice->Flags & DO_BUFFERED_IO) != 0) {
+        if ((wdmDevice->Flags & DO_BUFFERED_IO) != 0)
             buffer = (const UCHAR*)Irp->AssociatedIrp.SystemBuffer;
-        }
-        else if ((wdmDevice->Flags & DO_DIRECT_IO) != 0 && Irp->MdlAddress != NULL) {
-            buffer = (const UCHAR*)MmGetSystemAddressForMdlSafe(
-                Irp->MdlAddress,
-                NormalPagePriority
-            );
-        }
-
-        /*
-         * Fail open. If this stack ever presents METHOD_NEITHER-style data or
-         * mapping fails, do not touch it; simply let the print proceed.
-         */
-        if (buffer != NULL) {
-            QueueCapture(targetId, buffer, length);
-        }
+        else if ((wdmDevice->Flags & DO_DIRECT_IO) != 0 && Irp->MdlAddress)
+            buffer = (const UCHAR*)MmGetSystemAddressForMdlSafe(Irp->MdlAddress, NormalPagePriority);
+        if (buffer && targetId) QueueCapture(targetId, buffer, length);
+        else RecordDrop(length);
     }
-
-    /*
-     * Return the ORIGINAL, unmodified IRP to KMDF. Because this device was
-     * declared a filter and owns no write queue, KMDF forwards it to the next
-     * lower driver (usbprint.sys). Do not complete or re-format the write here.
-     */
     IoSkipCurrentIrpStackLocation(Irp);
     return WdfDeviceWdmDispatchPreprocessedIrp(Device, Irp);
 }
 
-VOID ZebraEvtIoDeviceControl(
-    WDFQUEUE Queue,
-    WDFREQUEST Request,
-    size_t OutputBufferLength,
-    size_t InputBufferLength,
-    ULONG IoControlCode
-)
+VOID ZebraEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request,
+    size_t OutputBufferLength, size_t InputBufferLength, ULONG IoControlCode)
 {
-    PCAPTURE_NODE node = NULL;
-    size_t needed;
-    PCAPTURE_OUTPUT out = NULL;
-    size_t actual = 0;
     NTSTATUS status;
-
+    size_t actual;
+    PCAPTURE_NODE node = NULL;
     UNREFERENCED_PARAMETER(Queue);
+    UNREFERENCED_PARAMETER(OutputBufferLength);
     UNREFERENCED_PARAMETER(InputBufferLength);
 
-    if (IoControlCode != IOCTL_ZEBRAUSBTAP_GET_NEXT) {
-        WdfRequestComplete(Request, STATUS_INVALID_DEVICE_REQUEST);
+    if (IoControlCode == IOCTL_ZEBRAUSBTAP_STATS) {
+        PCAPTURE_STATS_V2 out;
+        status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*out), (PVOID*)&out, &actual);
+        if (!NT_SUCCESS(status)) { WdfRequestComplete(Request, status); return; }
+        WdfSpinLockAcquire(gCaptureLock);
+        out->Version = ZEBRA_PROTOCOL_VERSION; out->Reserved = 0; out->Session = gSession;
+        out->QueuedBytes = (ULONGLONG)gQueuedBytes;
+        out->DroppedChunks = gDroppedChunks; out->DroppedBytes = gDroppedBytes;
+        WdfSpinLockRelease(gCaptureLock);
+        WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(*out));
         return;
     }
-
-    WdfSpinLockAcquire(gCaptureLock);
-    if (!IsListEmpty(&gCaptureList)) {
-        PLIST_ENTRY entry = RemoveHeadList(&gCaptureList);
-        node = CONTAINING_RECORD(entry, CAPTURE_NODE, Link);
-        gQueuedBytes -= (LONG)node->Length;
-    }
-    WdfSpinLockRelease(gCaptureLock);
-
-    if (!node) {
-        WdfRequestCompleteWithInformation(Request, STATUS_NO_MORE_ENTRIES, 0);
+    if (IoControlCode == IOCTL_ZEBRAUSBTAP_PEEK) {
+        PCAPTURE_OUTPUT_V2 out;
+        size_t needed;
+        WdfSpinLockAcquire(gCaptureLock);
+        if (!IsListEmpty(&gCaptureList)) {
+            node = CONTAINING_RECORD(gCaptureList.Flink, CAPTURE_NODE, Link);
+            InterlockedIncrement(&node->References);
+        }
+        WdfSpinLockRelease(gCaptureLock);
+        if (!node) { WdfRequestComplete(Request, STATUS_NO_MORE_ENTRIES); return; }
+        needed = FIELD_OFFSET(CAPTURE_OUTPUT_V2, Data) + node->Length;
+        status = WdfRequestRetrieveOutputBuffer(Request, needed, (PVOID*)&out, &actual);
+        if (NT_SUCCESS(status)) {
+            out->Version = ZEBRA_PROTOCOL_VERSION; out->TargetId = node->TargetId;
+            out->Length = node->Length; out->Reserved = 0;
+            out->Sequence = node->Sequence; out->Session = gSession; out->Stamp = node->Stamp;
+            RtlCopyMemory(out->Data, node->Data, node->Length);
+            WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, needed);
+        } else WdfRequestComplete(Request, status);
+        ReleaseCaptureNode(node);
         return;
     }
-
-    needed = FIELD_OFFSET(CAPTURE_OUTPUT, Data) + node->Length;
-    if (OutputBufferLength < needed) {
-        ExFreePool(node);
-        WdfRequestCompleteWithInformation(Request, STATUS_BUFFER_TOO_SMALL, needed);
+    if (IoControlCode == IOCTL_ZEBRAUSBTAP_ACK) {
+        PCAPTURE_ACK_V2 ack;
+        status = WdfRequestRetrieveInputBuffer(Request, sizeof(*ack), (PVOID*)&ack, &actual);
+        if (!NT_SUCCESS(status)) { WdfRequestComplete(Request, status); return; }
+        WdfSpinLockAcquire(gCaptureLock);
+        if (!IsListEmpty(&gCaptureList)) {
+            PCAPTURE_NODE head = CONTAINING_RECORD(gCaptureList.Flink, CAPTURE_NODE, Link);
+            if (ack->Session == gSession && ack->Sequence == head->Sequence) {
+                RemoveHeadList(&gCaptureList);
+                gQueuedBytes -= (LONG)head->Length;
+                node = head;
+            }
+        }
+        WdfSpinLockRelease(gCaptureLock);
+        if (!node) { WdfRequestComplete(Request, STATUS_INVALID_PARAMETER); return; }
+        ReleaseCaptureNode(node);
+        WdfRequestComplete(Request, STATUS_SUCCESS);
         return;
     }
-
-    status = WdfRequestRetrieveOutputBuffer(
-        Request,
-        needed,
-        (PVOID*)&out,
-        &actual
-    );
-
-    if (NT_SUCCESS(status)) {
-        out->TargetId = node->TargetId;
-        out->Length = node->Length;
-        out->Stamp = node->Stamp;
-        RtlCopyMemory(out->Data, node->Data, node->Length);
-        WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, needed);
-    }
-    else {
-        WdfRequestComplete(Request, status);
-    }
-
-    ExFreePool(node);
+    WdfRequestComplete(Request, STATUS_INVALID_DEVICE_REQUEST);
 }

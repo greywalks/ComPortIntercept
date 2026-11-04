@@ -11,7 +11,7 @@ if (-not $python) { throw 'Python was not found in PATH.' }
 $pythonExe = $python.Source
 
 $action = New-ScheduledTaskAction -Execute $pythonExe -Argument "`"$script`"" -WorkingDirectory $root
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1)
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Seconds 0)
 
 if ($Mode -eq 'System') {
     $trigger = New-ScheduledTaskTrigger -AtStartup

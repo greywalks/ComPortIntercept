@@ -2,256 +2,375 @@ from __future__ import annotations
 
 import base64
 import ctypes
-import hashlib
+import hmac
 import json
 import os
-import sqlite3
+import secrets
+import socket
 import struct
+import subprocess
 import threading
 import time
+import urllib.error
 import urllib.request
 from ctypes import wintypes
-from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlsplit
+
+try:
+    from .archive import Archive, StreamAssembler, now
+except ImportError:  # python server/app.py
+    from archive import Archive, StreamAssembler, now
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
-JOBS = DATA / "jobs"
-DB = DATA / "archive.db"
 CONFIG = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
-for p in (DATA, JOBS):
-    p.mkdir(parents=True, exist_ok=True)
-
 PRINTERS = {int(p["target_id"]): p for p in CONFIG["printers"]}
 CAPTURE_DEVICE = CONFIG.get("capture_device", r"\\.\ZebraUsbTap")
-IOCTL_GET_NEXT = 0x226004
+IOCTL_PEEK, IOCTL_ACK, IOCTL_STATS = 0x226008, 0x22600C, 0x226010
+HEADER = struct.Struct("<IIIIQQQ")
+STATS = struct.Struct("<IIQQQQ")
+MAX_CHUNK = 1024 * 1024
+MAX_HTTP_BODY = 2 * 1024 * 1024
 
-def now():
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
-def conn():
-    c = sqlite3.connect(DB, timeout=20)
-    c.row_factory = sqlite3.Row
-    return c
-
-with conn() as c:
-    c.executescript("""
-    CREATE TABLE IF NOT EXISTS jobs(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      captured_at TEXT NOT NULL,
-      target_id INTEGER NOT NULL,
-      printer_name TEXT NOT NULL,
-      windows_port TEXT NOT NULL,
-      byte_count INTEGER NOT NULL,
-      sha256 TEXT NOT NULL,
-      raw_path TEXT NOT NULL,
-      text TEXT,
-      origin TEXT NOT NULL DEFAULT 'Captured',
-      parent_job_id INTEGER,
-      reprint_count INTEGER NOT NULL DEFAULT 0,
-      last_reprinted_at TEXT
-    );
-    CREATE INDEX IF NOT EXISTS idx_jobs_time ON jobs(captured_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_jobs_sha ON jobs(sha256);
-    """)
-
-def decode(raw: bytes) -> str:
+def secure_token(data_dir):
+    """Create a per-install secret, restricted to Administrators/SYSTEM on Windows."""
+    private = Path(data_dir) / "private"
+    private.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.name == "nt":
+        # Reset explicit/inherited entries before applying a protected DACL.
+        # Run elevated and keep the whole installation in an admin-only folder.
+        subprocess.run(["icacls.exe", str(private), "/reset"], check=True, capture_output=True)
+        subprocess.run(["icacls.exe", str(private), "/inheritance:r", "/grant:r",
+                        "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F"],
+                       check=True, capture_output=True)
+    else:
+        os.chmod(private, 0o700)
+    token_file = private / "api-token"
     try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError:
-        return raw.decode("latin-1", errors="replace")
+        fd = os.open(token_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        pass
+    else:
+        with os.fdopen(fd, "w", encoding="ascii") as f:
+            f.write(secrets.token_urlsafe(32))
+            f.flush()
+            os.fsync(f.fileno())
+    if os.name == "nt":
+        subprocess.run(["icacls.exe", str(token_file), "/reset"], check=True, capture_output=True)
+        subprocess.run(["icacls.exe", str(token_file), "/inheritance:r", "/grant:r",
+                        "*S-1-5-18:F", "*S-1-5-32-544:F"], check=True, capture_output=True)
+    else:
+        os.chmod(token_file, 0o600)
+    token = token_file.read_text(encoding="ascii").strip()
+    if len(token) < 32 or not token.isascii():
+        raise RuntimeError("Invalid archive API token")
+    return token
 
-def save_job(target_id: int, raw: bytes, origin="Captured", parent_job_id=None) -> int:
-    p = PRINTERS.get(target_id, {"name": f"Target {target_id}", "windows_port": "Unknown"})
-    digest = hashlib.sha256(raw).hexdigest()
-    with conn() as c:
-        cur = c.execute(
-            """INSERT INTO jobs(captured_at,target_id,printer_name,windows_port,byte_count,sha256,raw_path,text,origin,parent_job_id)
-               VALUES(?,?,?,?,?,?, '',?,?,?)""",
-            (now(), target_id, p["name"], p["windows_port"], len(raw), digest, decode(raw), origin, parent_job_id),
-        )
-        job_id = int(cur.lastrowid)
-        rel = f"jobs/{job_id:010d}.bin"
-        (DATA / rel).write_bytes(raw)
-        c.execute("UPDATE jobs SET raw_path=? WHERE id=?", (rel, job_id))
-    return job_id
 
-class Assembler:
-    def __init__(self):
-        self.buf = bytearray()
+class CaptureService:
+    def __init__(self, archive, config):
+        self.archive, self.config = archive, config
+        self.state = {"connected": False, "last_error": None, "last_capture_at": None,
+                      "driver_session": None, "queued_bytes": 0, "dropped_chunks": 0, "dropped_bytes": 0}
         self.lock = threading.Lock()
-    def feed(self, chunk: bytes):
-        out = []
+        self.stop_event = threading.Event()
+        self.thread = None
+
+    def update(self, **values):
         with self.lock:
-            self.buf.extend(chunk)
-            while True:
-                b = bytes(self.buf)
-                u = b.upper()
-                start = u.find(b"^XA")
-                if start < 0:
-                    if len(self.buf) > 1024 * 1024:
-                        out.append(bytes(self.buf))
-                        self.buf.clear()
-                    break
-                if start:
-                    out.append(bytes(self.buf[:start]))
-                    del self.buf[:start]
-                    u = bytes(self.buf).upper()
-                end = u.find(b"^XZ", 3)
-                if end < 0:
-                    break
-                end += 3
-                out.append(bytes(self.buf[:end]))
-                del self.buf[:end]
-        return [x for x in out if x]
+            self.state.update(values)
 
-ASSEMBLERS = {tid: Assembler() for tid in PRINTERS}
-capture_state = {"connected": False, "last_error": None, "last_capture_at": None}
+    def status(self):
+        with self.lock:
+            return dict(self.state)
 
-def capture_loop():
-    if os.name != "nt" or not CONFIG.get("capture_enabled", True):
-        return
-    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    CreateFileW = k32.CreateFileW
-    CreateFileW.argtypes = [wintypes.LPCWSTR,wintypes.DWORD,wintypes.DWORD,ctypes.c_void_p,wintypes.DWORD,wintypes.DWORD,wintypes.HANDLE]
-    CreateFileW.restype = wintypes.HANDLE
-    DeviceIoControl = k32.DeviceIoControl
-    DeviceIoControl.argtypes = [wintypes.HANDLE,wintypes.DWORD,ctypes.c_void_p,wintypes.DWORD,ctypes.c_void_p,wintypes.DWORD,ctypes.POINTER(wintypes.DWORD),ctypes.c_void_p]
-    DeviceIoControl.restype = wintypes.BOOL
-    CloseHandle = k32.CloseHandle
-    CloseHandle.argtypes = [wintypes.HANDLE]
-    INVALID = wintypes.HANDLE(-1).value
-    while True:
-        h = CreateFileW(CAPTURE_DEVICE, 0x80000000, 0x3, None, 3, 0, None)
-        if h == INVALID:
-            capture_state.update(connected=False, last_error=f"CreateFile failed: {ctypes.get_last_error()}")
-            time.sleep(2)
-            continue
-        capture_state.update(connected=True, last_error=None)
+    def start(self):
+        self.thread = threading.Thread(target=self.run, name="capture", daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+        if self.thread:
+            self.thread.join(timeout=5)
+
+    def run(self):
+        if os.name != "nt" or not self.config.get("capture_enabled", True):
+            self.update(connected=False, last_error="Capture disabled or unavailable on this operating system")
+            return
+        while not self.stop_event.is_set():
+            try:
+                assembler = StreamAssembler(self.archive, int(self.config.get("standalone_flush_ms", 400)),
+                                            int(self.config.get("max_segment_bytes", 4 * 1024 * 1024)))
+                assembler.recover()
+                self._poll_windows(assembler)
+            except Exception as exc:
+                # A dead or blocked capture worker must never remain green.
+                self.update(connected=False, last_error=f"Capture stopped: {exc}")
+            self.stop_event.wait(2)
+
+    def _poll_windows(self, assembler):
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create, control, close = k32.CreateFileW, k32.DeviceIoControl, k32.CloseHandle
+        create.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                           wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        create.restype = wintypes.HANDLE
+        control.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+                            ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+        control.restype = wintypes.BOOL
+        close.argtypes = [wintypes.HANDLE]
+        handle = create(self.config.get("capture_device", CAPTURE_DEVICE), 0x80000000, 0x3, None, 3, 0, None)
+        if handle == wintypes.HANDLE(-1).value:
+            raise OSError(ctypes.get_last_error(), "Unable to open capture device")
         try:
-            while True:
-                buf = ctypes.create_string_buffer(1024 * 1024 + 32)
-                got = wintypes.DWORD(0)
-                ok = DeviceIoControl(h, IOCTL_GET_NEXT, None, 0, buf, len(buf), ctypes.byref(got), None)
-                if not ok:
-                    err = ctypes.get_last_error()
-                    if err in (259, 234):
-                        time.sleep(0.05)
+            buffer = ctypes.create_string_buffer(MAX_CHUNK + HEADER.size)
+            statsbuf = ctypes.create_string_buffer(STATS.size)
+            next_stats = 0.0
+            while not self.stop_event.is_set():
+                if time.monotonic() >= next_stats:
+                    got = wintypes.DWORD()
+                    if not control(handle, IOCTL_STATS, None, 0, statsbuf, len(statsbuf), ctypes.byref(got), None):
+                        code = ctypes.get_last_error()
+                        raise RuntimeError(f"Driver protocol v2 unavailable (Windows error {code}); update driver and service together")
+                    if got.value != STATS.size:
+                        raise RuntimeError("Invalid driver statistics response")
+                    version, _, session, queued, dropped, dropped_bytes = STATS.unpack(statsbuf.raw)
+                    if version != 2:
+                        raise RuntimeError(f"Unsupported driver protocol {version}")
+                    self.archive.observe_session(session, queued)
+                    if dropped:
+                        self.archive.record_loss(session, dropped, dropped_bytes)
+                    self.update(connected=True, last_error=None, driver_session=str(session), queued_bytes=queued,
+                                dropped_chunks=dropped, dropped_bytes=dropped_bytes)
+                    next_stats = time.monotonic() + 0.5
+                got = wintypes.DWORD()
+                if not control(handle, IOCTL_PEEK, None, 0, buffer, len(buffer), ctypes.byref(got), None):
+                    code = ctypes.get_last_error()
+                    if code == 259:  # ERROR_NO_MORE_ITEMS
+                        assembler.flush_idle()
+                        self.stop_event.wait(0.05)
                         continue
-                    capture_state.update(connected=False, last_error=f"DeviceIoControl failed: {err}")
-                    break
-                if got.value < 16:
-                    time.sleep(0.02)
-                    continue
-                target_id, length, _stamp = struct.unpack_from("<IIQ", buf.raw, 0)
-                raw = bytes(buf.raw[16:16+length])
-                capture_state["last_capture_at"] = now()
-                for payload in ASSEMBLERS.setdefault(target_id, Assembler()).feed(raw):
-                    save_job(target_id, payload)
+                    raise OSError(code, "Capture peek failed")
+                if got.value < HEADER.size:
+                    raise RuntimeError("Short capture header")
+                version, target, length, _, seq, session, stamp = HEADER.unpack_from(buffer.raw)
+                if version != 2 or length > MAX_CHUNK or got.value != HEADER.size + length:
+                    raise RuntimeError("Invalid capture response")
+                raw = bytes(buffer.raw[HEADER.size:HEADER.size + length])
+                inserted = self.archive.put_chunk(session, seq, target, stamp, raw)
+                ack_data = ctypes.create_string_buffer(struct.pack("<QQ", session, seq))
+                ack_got = wintypes.DWORD()
+                if not control(handle, IOCTL_ACK, ack_data, 16, None, 0, ctypes.byref(ack_got), None):
+                    raise OSError(ctypes.get_last_error(), "Capture acknowledgement failed")
+                if inserted:
+                    assembler.feed(session, seq, target, raw, stamp)
+                self.update(last_capture_at=now())
+                assembler.flush_idle()
+            assembler.flush_idle(force=True, reason="service-stop")
         finally:
-            CloseHandle(h)
-        time.sleep(1)
+            close(handle)
+            self.update(connected=False)
 
-def raw_print(queue: str, raw: bytes, title: str):
+
+def raw_print(queue, raw, title):
     if os.name != "nt":
         raise RuntimeError("Reprint requires Windows")
     class DOC_INFO_1W(ctypes.Structure):
-        _fields_=[("pDocName",wintypes.LPWSTR),("pOutputFile",wintypes.LPWSTR),("pDatatype",wintypes.LPWSTR)]
+        _fields_ = [("pDocName", wintypes.LPWSTR), ("pOutputFile", wintypes.LPWSTR), ("pDatatype", wintypes.LPWSTR)]
     ws = ctypes.WinDLL("winspool.drv", use_last_error=True)
+    ws.OpenPrinterW.argtypes = [wintypes.LPWSTR, ctypes.POINTER(wintypes.HANDLE), ctypes.c_void_p]
+    ws.OpenPrinterW.restype = wintypes.BOOL
+    ws.StartDocPrinterW.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p]
+    ws.StartDocPrinterW.restype = wintypes.DWORD
+    for name in ("StartPagePrinter", "EndPagePrinter", "EndDocPrinter", "ClosePrinter", "AbortPrinter"):
+        fn = getattr(ws, name); fn.argtypes = [wintypes.HANDLE]; fn.restype = wintypes.BOOL
+    ws.WritePrinter.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    ws.WritePrinter.restype = wintypes.BOOL
     hp = wintypes.HANDLE()
     if not ws.OpenPrinterW(queue, ctypes.byref(hp), None):
         raise OSError(ctypes.get_last_error(), "OpenPrinterW failed")
+    started = False
     try:
         di = DOC_INFO_1W(title, None, "RAW")
         if not ws.StartDocPrinterW(hp, 1, ctypes.byref(di)):
             raise OSError(ctypes.get_last_error(), "StartDocPrinterW failed")
-        try:
-            ws.StartPagePrinter(hp)
-            written = wintypes.DWORD()
-            data = ctypes.create_string_buffer(raw)
-            if not ws.WritePrinter(hp, data, len(raw), ctypes.byref(written)) or written.value != len(raw):
-                raise OSError(ctypes.get_last_error(), f"WritePrinter wrote {written.value}/{len(raw)} bytes")
-            ws.EndPagePrinter(hp)
-        finally:
-            ws.EndDocPrinter(hp)
+        started = True
+        if not ws.StartPagePrinter(hp):
+            raise OSError(ctypes.get_last_error(), "StartPagePrinter failed")
+        written = wintypes.DWORD()
+        data = ctypes.create_string_buffer(raw)
+        if not ws.WritePrinter(hp, data, len(raw), ctypes.byref(written)) or written.value != len(raw):
+            raise OSError(ctypes.get_last_error(), f"WritePrinter wrote {written.value}/{len(raw)} bytes")
+        if not ws.EndPagePrinter(hp):
+            raise OSError(ctypes.get_last_error(), "EndPagePrinter failed")
+        if not ws.EndDocPrinter(hp):
+            raise OSError(ctypes.get_last_error(), "EndDocPrinter failed")
+        started = False
     finally:
+        if started:
+            ws.AbortPrinter(hp)
         ws.ClosePrinter(hp)
 
-def render_preview(raw: bytes, target_id: int) -> bytes:
-    if CONFIG.get("preview_provider") != "labelary":
-        raise RuntimeError("Preview disabled")
-    p = PRINTERS[target_id]
-    url = CONFIG.get("labelary_url","https://api.labelary.com").rstrip("/") + f"/v1/printers/{p.get('label_dpmm',8)}dpmm/labels/{p.get('label_width_in',4)}x{p.get('label_height_in',6)}/0/"
-    req = urllib.request.Request(url, data=raw, method="POST", headers={"Accept":"image/png","Content-Type":"application/x-www-form-urlencoded","User-Agent":"ComPortIntercept/1.0"})
-    with urllib.request.urlopen(req, timeout=15) as r:
-        return r.read()
 
-INDEX = ROOT / "web" / "index.html"
+def render_preview(raw, target_id, config, printers):
+    if config.get("preview_provider", "disabled") != "labelary":
+        raise RuntimeError("External previews are disabled")
+    p = printers[target_id]
+    base = config.get("labelary_url", "https://api.labelary.com").rstrip("/")
+    if not base.startswith("https://"):
+        raise RuntimeError("Preview service must use HTTPS")
+    url = base + f"/v1/printers/{p.get('label_dpmm',8)}dpmm/labels/{p.get('label_width_in',4)}x{p.get('label_height_in',6)}/0/"
+    req = urllib.request.Request(url, data=raw, method="POST", headers={"Accept": "image/png", "Content-Type": "application/x-www-form-urlencoded"})
+    with urllib.request.urlopen(req, timeout=15) as response:
+        return response.read(4 * 1024 * 1024 + 1)
+
+
+class ArchiveServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = os.name != "nt"
+    def server_bind(self):
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+    def __init__(self, address, archive, token, config, capture=None):
+        if address[0] != "127.0.0.1":
+            raise ValueError("The archive server may bind only to 127.0.0.1")
+        super().__init__(address, Handler)
+        self.archive, self.token, self.config, self.capture = archive, token, config, capture
+
 
 class Handler(BaseHTTPRequestHandler):
+    server_version = "ComPortIntercept"
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(10)
+
     def log_message(self, fmt, *args):
+        # Never log tokens or request bodies.
         print(fmt % args)
-    def send_json(self, obj, status=200):
-        b=json.dumps(obj, ensure_ascii=False).encode()
-        self.send_response(status); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(b))); self.send_header("Cache-Control","no-store"); self.end_headers(); self.wfile.write(b)
+
+    def security_headers(self):
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' blob:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
+
+    def send_json(self, value, status=200):
+        body = json.dumps(value, ensure_ascii=False).encode("utf-8")
+        self.send_response(status); self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body))); self.security_headers(); self.end_headers(); self.wfile.write(body)
+
+    def local_request(self):
+        port = self.server.server_address[1]
+        host = self.headers.get("Host", "").lower()
+        if host not in (f"127.0.0.1:{port}", f"localhost:{port}"):
+            return False
+        origin = self.headers.get("Origin")
+        return not origin or origin.lower() in (f"http://127.0.0.1:{port}", f"http://localhost:{port}")
+
+    def allowed(self):
+        if not self.local_request():
+            self.send_json({"error": "Invalid host or origin"}, 403); return False
+        value = self.headers.get("Authorization", "")
+        valid = value.startswith("Bearer ") and value[7:].isascii() and hmac.compare_digest(value[7:], self.server.token)
+        if not valid:
+            self.send_json({"error": "Authentication required"}, 401); return False
+        return True
+
     def do_GET(self):
-        u=urlparse(self.path)
-        if u.path == "/":
-            b=INDEX.read_bytes(); self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8"); self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b); return
-        if u.path == "/api/status":
-            self.send_json({"ok":True,"capture_connected":capture_state["connected"],"capture_error":capture_state["last_error"],"last_capture_at":capture_state["last_capture_at"],"printers":list(PRINTERS.values())}); return
-        if u.path == "/api/jobs":
-            q=parse_qs(u.query).get("q",[""])[0].strip()
-            sql="SELECT * FROM jobs"; params=[]
-            if q:
-                sql += " WHERE text LIKE ? OR printer_name LIKE ? OR windows_port LIKE ? OR origin LIKE ?"; n=f"%{q}%"; params=[n,n,n,n]
-            sql += " ORDER BY id DESC LIMIT 500"
-            with conn() as c: rows=[dict(r) for r in c.execute(sql,params).fetchall()]
-            for r in rows: r.pop("raw_path",None)
-            self.send_json(rows); return
-        if u.path.startswith("/api/jobs/") and u.path.endswith("/preview"):
-            job_id=int(u.path.split("/")[3])
-            with conn() as c: row=c.execute("SELECT * FROM jobs WHERE id=?",(job_id,)).fetchone()
-            if not row: self.send_error(404); return
-            try: img=render_preview((DATA/row["raw_path"]).read_bytes(), int(row["target_id"]))
-            except Exception as e: self.send_json({"error":str(e)},422); return
-            self.send_response(200); self.send_header("Content-Type","image/png"); self.send_header("Content-Length",str(len(img))); self.end_headers(); self.wfile.write(img); return
-        if u.path.startswith("/api/jobs/"):
-            job_id=int(u.path.split("/")[3])
-            with conn() as c: row=c.execute("SELECT * FROM jobs WHERE id=?",(job_id,)).fetchone()
-            if not row: self.send_error(404); return
-            d=dict(row); d["text"]=d.get("text") or ""; d.pop("raw_path",None); self.send_json(d); return
-        self.send_error(404)
+        path = urlsplit(self.path).path
+        if not self.local_request():
+            self.send_json({"error": "Invalid host or origin"}, 403); return
+        if path in ("/", "/app.js", "/style.css"):
+            file = ROOT / "web" / ({"/": "index.html", "/app.js": "app.js", "/style.css": "style.css"}[path])
+            body = file.read_bytes()
+            content_type = {"/": "text/html", "/app.js": "text/javascript", "/style.css": "text/css"}[path]
+            self.send_response(200); self.send_header("Content-Type", content_type + "; charset=utf-8")
+            self.send_header("Content-Length", str(len(body))); self.security_headers(); self.end_headers(); self.wfile.write(body); return
+        if not self.allowed(): return
+        if path == "/api/status":
+            state = self.server.capture.status() if self.server.capture else {"connected": False}
+            self.send_json({"ok": True, **state, "capture_connected": state.get("connected", False),
+                            "capture_error": state.get("last_error"), "loss_events": self.server.archive.recent_losses(), "driver_restarts": self.server.archive.recent_restarts(),
+                            "preview_provider": self.server.config.get("preview_provider", "disabled"),
+                            "printers": list(self.server.archive.printers.values())}); return
+        if path == "/api/jobs":
+            query = parse_qs(urlsplit(self.path).query).get("q", [""])[0].strip()
+            self.send_json(self.server.archive.list_jobs(query[:500])); return
+        parts = path.strip("/").split("/")
+        if len(parts) in (3, 4) and parts[:2] == ["api", "jobs"] and parts[2].isdigit():
+            row = self.server.archive.get_job(int(parts[2]))
+            if not row: self.send_json({"error": "Not found"}, 404); return
+            if len(parts) == 4 and parts[3] == "preview":
+                # This POST-like side effect is intentionally disallowed on GET.
+                self.send_json({"error": "Use the preview action"}, 405); return
+            if len(parts) == 3:
+                row.pop("raw_path", None); self.send_json(row); return
+        self.send_json({"error": "Not found"}, 404)
+
     def do_POST(self):
-        u=urlparse(self.path)
-        n=int(self.headers.get("Content-Length","0")); body=self.rfile.read(n) if n else b""
-        if u.path == "/api/ingest":
-            try:
-                o=json.loads(body.decode()); raw=base64.b64decode(o["base64"]); tid=int(o.get("target_id",1))
-                ids=[save_job(tid,p,"Demo/Test") for p in ASSEMBLERS.setdefault(tid,Assembler()).feed(raw)]
-                if not ids and raw: ids=[save_job(tid,raw,"Demo/Test")]
-                self.send_json({"ok":True,"job_ids":ids})
-            except Exception as e: self.send_json({"error":str(e)},400)
-            return
-        if u.path.startswith("/api/jobs/") and u.path.endswith("/reprint"):
-            job_id=int(u.path.split("/")[3])
-            with conn() as c: row=c.execute("SELECT * FROM jobs WHERE id=?",(job_id,)).fetchone()
-            if not row: self.send_error(404); return
-            try:
-                raw=(DATA/row["raw_path"]).read_bytes(); raw_print(row["printer_name"],raw,f"ComPortIntercept Reprint #{job_id}")
-                with conn() as c: c.execute("UPDATE jobs SET reprint_count=reprint_count+1,last_reprinted_at=? WHERE id=?",(now(),job_id))
-                self.send_json({"ok":True})
-            except Exception as e: self.send_json({"ok":False,"error":str(e)},409)
-            return
-        self.send_error(404)
+        if not self.allowed(): return
+        try:
+            size = int(self.headers.get("Content-Length", "0"))
+            if size < 0 or size > MAX_HTTP_BODY: raise ValueError("Request body too large")
+            body = self.rfile.read(size)
+            path = urlsplit(self.path).path
+            if path == "/api/ingest":
+                if not self.server.config.get("enable_test_ingest", False):
+                    self.send_json({"error": "Test ingestion is disabled"}, 403); return
+                item = json.loads(body.decode("utf-8"))
+                raw = base64.b64decode(item["base64"], validate=True)
+                target = int(item.get("target_id", 1))
+                if target not in self.server.archive.printers: raise ValueError("Unknown printer target")
+                job = self.server.archive.save_demo(target, raw)
+                self.send_json({"ok": True, "job_ids": [job]}); return
+            parts = path.strip("/").split("/")
+            if len(parts) != 4 or parts[:2] != ["api", "jobs"] or not parts[2].isdigit():
+                self.send_json({"error": "Not found"}, 404); return
+            row = self.server.archive.get_job(int(parts[2]))
+            if not row: self.send_json({"error": "Not found"}, 404); return
+            raw = self.server.archive.read_raw(row)
+            if parts[3] == "preview":
+                img = render_preview(raw, row["target_id"], self.server.config, self.server.archive.printers)
+                if len(img) > 4 * 1024 * 1024: raise ValueError("Preview exceeds size limit")
+                self.send_response(200); self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(img))); self.security_headers(); self.end_headers(); self.wfile.write(img); return
+            if parts[3] == "reprint":
+                attempt = self.server.archive.start_reprint(row)
+                try:
+                    raw_print(row["printer_name"], raw, f"ComPortIntercept Reprint #{row['id']}")
+                except Exception as exc:
+                    self.server.archive.finish_reprint(attempt, row["id"], exc)
+                    self.send_json({"ok": False, "error": str(exc)}, 409); return
+                self.server.archive.finish_reprint(attempt, row["id"])
+                self.send_json({"ok": True, "message": "Submitted to the Windows spooler; physical output is not confirmed"}); return
+            self.send_json({"error": "Not found"}, 404)
+        except (ValueError, KeyError, json.JSONDecodeError) as exc:
+            self.send_json({"error": str(exc)}, 400)
+        except Exception as exc:
+            self.send_json({"error": str(exc)}, 409)
+
 
 def main():
-    threading.Thread(target=capture_loop,daemon=True).start()
-    host=CONFIG.get("listen_host","127.0.0.1"); port=int(CONFIG.get("listen_port",8765))
-    print(f"ComPortIntercept running at http://{host}:{port}")
-    ThreadingHTTPServer((host,port),Handler).serve_forever()
+    if CONFIG.get("listen_host", "127.0.0.1") != "127.0.0.1":
+        raise RuntimeError("listen_host must be 127.0.0.1")
+    archive = Archive(DATA, PRINTERS)
+    token = secure_token(DATA)
+    capture = CaptureService(archive, CONFIG)
+    server = ArchiveServer(("127.0.0.1", int(CONFIG.get("listen_port", 8765))), archive, token, CONFIG, capture)
+    capture.start()
+    print(f"Archive running at http://127.0.0.1:{server.server_address[1]} (API token: data/private/api-token)")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        capture.stop()
+        server.server_close()
+
 
 if __name__ == "__main__":
     main()

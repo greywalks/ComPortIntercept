@@ -4,7 +4,7 @@
   "capture_device": "\\\\.\\ZebraUsbTap",
   "capture_enabled": true,
   "standalone_flush_ms": 400,
-  "preview_provider": "labelary",
+  "preview_provider": "disabled",
   "labelary_url": "https://api.labelary.com",
   "printers": [
     {
@@ -29,5 +29,7 @@
       "label_width_in": 4,
       "label_height_in": 6
     }
-  ]
+  ],
+  "enable_test_ingest": false,
+  "max_segment_bytes": 4194304
 }

@@ -1,23 +1,3 @@
-# Driver build/install
+# Driver build and install
 
-The supported workflow is documented in [`../docs/DEPLOYMENT.md`](../docs/DEPLOYMENT.md).
-
-Build:
-
-```powershell
-.\driver\Build-Driver.ps1
-```
-
-Install from Administrator PowerShell:
-
-```powershell
-.\driver\Install-Driver.ps1
-```
-
-Rollback:
-
-```powershell
-.\driver\Uninstall-Driver.ps1
-```
-
-The INF targets the physical devices `USB\VID_0A5F&PID_0080` and `USB\VID_0A5F&PID_0062` as device-specific upper filters. Do not change the package back to the `USBPRINT\...` child IDs; that was tested and did not observe the required print traffic.
+See [../docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md). Protocol v2 requires Windows 10 2004+ and a matching v2 archive service. Build and sign the package, test normal printing with the archive stopped, and follow the full acceptance and rollback procedure on a designated test system.
