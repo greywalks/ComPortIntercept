@@ -27,7 +27,7 @@ function setup(options = {}) {
       printCount++; return delayedPrint || response({message:'submitted'});
     }
     if (path.startsWith('/api/jobs/1/preview?index='))
-      return {ok:true, headers:{get:()=> '2'}, blob:async()=>({})};
+      return {ok:true, headers:{get:()=> options.noPreviewCount ? null : '2'}, blob:async()=>({})};
     if (path.startsWith('/api/jobs?q=')) return response([]);
     throw new Error('Unexpected request ' + path);
   };
@@ -78,6 +78,16 @@ test('multiple previews show count and permit navigation', async () => {
   await vm.runInContext('loadPreview(1)', ui.context);
   assert.match(ui.element('preview-meta').textContent, /Label 2 of 2/);
   assert.equal(ui.element('preview-next').disabled, true);
+});
+
+test('preview navigation remains available when the provider omits a count', async () => {
+  const ui = setup({noPreviewCount:true}); await vm.runInContext('pick(1)', ui.context);
+  await vm.runInContext('loadPreview(0)', ui.context);
+  assert.match(ui.element('preview-meta').textContent, /total label count unavailable/);
+  assert.equal(ui.element('preview-next').disabled, false);
+  await ui.element('preview-next').events.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(ui.requests.some(r => r.path === '/api/jobs/1/preview?index=1'));
 });
 
 test('known capture loss requires a separate explicit acknowledgment', async () => {

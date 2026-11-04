@@ -111,7 +111,7 @@ async function loadPreview(index) {
   finally {
     previewPending = false;
     $('preview-prev').disabled = !selectionReady || previewIndex <= 0;
-    $('preview-next').disabled = !selectionReady || previewTotal === null || previewIndex + 1 >= previewTotal || previewIndex >= 9999;
+    $('preview-next').disabled = !selectionReady || (previewTotal !== null && previewIndex + 1 >= previewTotal) || previewIndex >= 9999;
   }
 }
 $('preview-button').addEventListener('click', async () => {
@@ -119,6 +119,6 @@ $('preview-button').addEventListener('click', async () => {
   await loadPreview(0);
 });
 $('preview-prev').addEventListener('click', () => { if (previewIndex > 0) loadPreview(previewIndex - 1); });
-$('preview-next').addEventListener('click', () => { if (previewTotal !== null && previewIndex + 1 < previewTotal) loadPreview(previewIndex + 1); });
+$('preview-next').addEventListener('click', () => { if (previewIndex < 9999 && (previewTotal === null || previewIndex + 1 < previewTotal)) loadPreview(previewIndex + 1); });
 let timer; $('q').addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(() => jobs().catch(showError), 250); });
 setInterval(() => { if (token) { status().catch(showError); jobs().catch(showError); } }, 5000);
