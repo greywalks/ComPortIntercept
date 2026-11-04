@@ -1,5 +1,7 @@
 # Lessons learned during the first deployment
 
+> Historical notes for the original 1.0 driver. Protocol v2 changes capture and cleanup; none of the original physical tests validates the new driver. Follow the current deployment acceptance procedure.
+
 This file records the dead ends so future deployments do not repeat them.
 
 ## 1. These printers were not COM devices
@@ -77,7 +79,7 @@ A successful redeployment requires four independent checks:
 1. Filter attaches and reaches `STATE 4 RUNNING`.
 2. With the archive server **off**, a normal label still prints.
 3. With the server **on**, a normal label still prints **and** creates a history record / updates `last_capture_at`.
-4. `Reprint Exact Job` physically prints the exact archived payload.
+4. `Reprint Captured Segment` submits the selected bytes; physical output requires separate confirmation.
 
 Do not infer one test from another.
 

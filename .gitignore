@@ -25,3 +25,6 @@ driver/*.lastbuildstate
 # Python
 __pycache__/
 *.pyc
+
+# Local authentication material
+data/private/

@@ -37,8 +37,12 @@ sc.exe query ZebraUsbTap
 
 Write-Host "`n=== Archive server ===" -ForegroundColor Cyan
 try {
-    $s = Invoke-RestMethod -Uri 'http://127.0.0.1:8765/api/status' -TimeoutSec 3
+    $root = Split-Path -Parent $PSScriptRoot
+    $config = Get-Content (Join-Path $root 'config.json') -Raw | ConvertFrom-Json
+    $token = (Get-Content (Join-Path $root 'data\private\api-token') -Raw).Trim()
+    $headers = @{ Authorization = "Bearer $token" }
+    $s = Invoke-RestMethod -Uri "http://127.0.0.1:$($config.listen_port)/api/status" -Headers $headers -TimeoutSec 3
     $s | ConvertTo-Json -Depth 6
 } catch {
-    Write-Host "Archive API not reachable: $($_.Exception.Message)" -ForegroundColor Yellow
+    Write-Host "Archive API not reachable or token inaccessible: $($_.Exception.Message)" -ForegroundColor Yellow
 }

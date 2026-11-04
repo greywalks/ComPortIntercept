@@ -1,148 +1,73 @@
 # ComPortIntercept / Zebra USB Print Archive
 
-A reusable Windows package for transparently archiving the exact outbound bytes sent to two Zebra USB printers, regardless of the application that initiated the print.
+Windows software for observing outbound writes to two Zebra USB printer devices, keeping the observed bytes, searching them, and submitting a captured segment to the original Windows queue.
 
-> Historical name: this project began as a COM-port interception idea. Device discovery showed the printers are USB printer devices (`USB002` / `USB007`), so the working implementation is a targeted KMDF USB upper filter plus a local archive service.
+> **Verification status:** This version changes the kernel driver and its user-mode protocol. It has not yet been built, signed, installed, or tested against the physical printers in the original environment. Use a test workstation and follow the acceptance/rollback procedure in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) before considering deployment.
 
-## Target deployment
+## What a record means
 
-| Target | Windows queue | Port | Physical USB hardware ID | USBPRINT child ID |
-|---|---|---|---|---|
-| GK420d | `ZDesigner GK420d` | `USB002` | `USB\VID_0A5F&PID_0080` | `USBPRINT\Zebra_TechnologiesZT9BEC` |
-| ZP 500 | `Zebra ZP 500 (ZPL)` | `USB007` | `USB\VID_0A5F&PID_0062` | `USBPRINT\Zebra_TechnologiesZT7D5C` |
+The filter observes USB-stack write requests. It does **not** see reliable Windows spooler-job boundaries or prove that a lower driver or physical printer completed a write. The server groups bytes by printer, capture time and configured size into **stream segments**. A segment may contain part of a job or multiple jobs. Reprinting sends the exact bytes of that segment to the spooler; it is not proof of an exact original job or successful physical output.
 
-The **filter attaches to the physical USB device IDs**, not the USBPRINT child IDs. That distinction was one of the key findings from the original deployment.
+Raw chunks are committed to SQLite before the driver is asked to discard them. Pending chunks are recovered after a user-mode restart. The driver keeps at most 16 MiB in memory; allocation failures, unmappable requests and overflow are counted and displayed when the service reconnects. A machine crash, driver unload, unplug, or loss while neither the service nor driver is active can still lose in-memory data. The status page reports known drops and driver restarts, but cannot prove there were no unobserved losses.
 
-## What it does
+## Target printers and prerequisites
 
-- Transparently observes outbound printer writes without taking ownership of the print request.
-- Stores exact captured bytes in `data/jobs/*.bin`.
-- Reassembles normal ZPL `^XA ... ^XZ` labels when Windows splits them across writes.
-- Stores searchable metadata in SQLite.
-- Provides a local web UI at `http://127.0.0.1:8765`.
-- Can render ZPL previews through Labelary (optional; see privacy note).
-- Can resend the exact archived bytes to the original Windows queue as a `RAW` print job.
-- Marks archive-initiated reprints separately when the capture path sees them again.
+| Target | Default Windows queue | Physical USB hardware ID |
+|---|---|---|
+| GK420d | `ZDesigner GK420d` | `USB\VID_0A5F&PID_0080` |
+| ZP 500 | `Zebra ZP 500 (ZPL)` | `USB\VID_0A5F&PID_0062` |
 
-## Working driver design
+- Windows 10 **version 2004 / build 19041 or newer**, x64; Python 3.9 or later.
+- Visual Studio 2022, the C++ workload, a matching Windows SDK and WDK, and administrator rights.
+- A kernel driver package signed in a manner accepted by the destination PC. Test-signing is for a designated test system; see [docs/TEST_SIGNING.md](docs/TEST_SIGNING.md).
+- A protected installation folder where only administrators and SYSTEM can modify the application, driver packages, config, data, and Python executable. This is essential if the startup task runs as SYSTEM.
+- The current mapping assumes one physical device of each model and the configured queue names. Two identical devices cannot currently be distinguished.
 
-The final driver is a device-specific KMDF upper filter on the two physical Zebra USB devices.
+## Deployment overview
 
-For `IRP_MJ_WRITE` it:
+Back up `data/` and confirm both printers work before making changes. Stop the old archive service, then install the driver and service from the **same version**: protocol v2 intentionally rejects the old driver. A driver update affects printer stacks and requires signing and staged testing.
 
-1. observes the request in `EvtDeviceWdmIrpPreprocess`;
-2. copies buffered/direct-I/O data when it can do so safely;
-3. fails open if capture is not possible;
-4. calls `IoSkipCurrentIrpStackLocation(Irp)`;
-5. returns the original IRP through `WdfDeviceWdmDispatchPreprocessedIrp`.
-
-There is intentionally **no `EvtIoWrite` PnP-device queue** in the final implementation.
-
-Microsoft references:
-
-- WDF preprocess dispatch: https://learn.microsoft.com/windows-hardware/drivers/ddi/wdfdevice/nf-wdfdevice-wdfdevicewdmdispatchpreprocessedirp
-- KMDF filter forwarding: https://learn.microsoft.com/windows-hardware/drivers/ddi/wdffdo/nf-wdffdo-wdffdoinitsetfilter
-- Device-specific filter installation: https://learn.microsoft.com/windows-hardware/drivers/install/inf-addfilter-directive
-
-## Quick deployment
-
-Run these from an **Administrator PowerShell** on the target PC.
-
-### 1. Confirm the printers and device IDs
+From an elevated PowerShell in the protected installation folder:
 
 ```powershell
 .\tools\Discover-ZebraTargets.ps1
-```
-
-### 2. Build the driver
-
-Install Visual Studio 2022, Desktop C++ workload, Windows SDK, and WDK, then:
-
-```powershell
 .\driver\Build-Driver.ps1
-```
-
-### 3. Sign appropriately
-
-For durable deployment, use a Microsoft-accepted production/attestation signing path. WDK test signing is suitable only for development/testing. See [`docs/TEST_SIGNING.md`](docs/TEST_SIGNING.md).
-
-### 4. Install the filter
-
-```powershell
+# Sign the built package appropriately before proceeding.
 .\driver\Install-Driver.ps1
 .\tools\Verify-Deployment.ps1
 ```
 
-Do **not** proceed to capture testing until `sc.exe query ZebraUsbTap` reports `STATE : 4 RUNNING`.
-
-### 5. Prove transparent pass-through first
-
-Keep the archive server **off** and print one normal label. It must print normally. If it does not, stop and roll back with:
-
-```powershell
-.\driver\Uninstall-Driver.ps1
-```
-
-### 6. Start the archive
+With the archive stopped, verify normal printing on **each** printer. Then start it:
 
 ```powershell
 .\install\Start-Archive.ps1
 ```
 
-Open `http://127.0.0.1:8765` and print one normal label. The acceptance test is **both**:
-
-- the physical label prints normally; and
-- `/api/status` updates `last_capture_at` and a history record appears.
-
-### 7. Test exact reprint
-
-Select the new captured record and use **Reprint Exact Job**. Confirm the physical output succeeds.
-
-### 8. Optional startup task
+Open `http://127.0.0.1:8765` and unlock with the token shown by this command in an **elevated** PowerShell:
 
 ```powershell
-.\install\Install-StartupTask.ps1
+Get-Content .\data\private\api-token
 ```
 
-or, for a machine-level task:
+Treat the token as a password. It is created locally and the Windows ACL is restricted to Administrators and SYSTEM. It is not stored in this repository. The web server only binds to `127.0.0.1`; the API requires the token and validates the Host and any Origin header. If startup cannot secure the token, it fails instead of exposing the API. To rotate it, stop the service, delete the token as an administrator, and restart.
+
+Print a test label to each printer and verify physical output, a new record, expected target, sensible byte content, and zero unexpected drop counters. Test a known captured segment using **Reprint Captured Segment**, then verify physical output separately. A `Possible Reprint` record is a time-and-hash match, not certain provenance. If a print or its audit update reports an uncertain outcome, check the physical printer before retrying.
+
+Follow [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the complete upgrade, testing and rollback sequence. The optional startup task uses an unlimited execution time and can be installed with `.\install\Install-StartupTask.ps1`; `-Mode System` requires the protected installation described above.
+
+## Privacy and diagnostics
+
+Labelary previews are **disabled by default**. To enable them, set `preview_provider` to `labelary` in `config.json` and restart. The UI then asks before sending the selected segment to Labelary over HTTPS. Do not enable it for sensitive labels unless that external transfer is approved.
+
+The test-ingest API is disabled by default. To run its optional diagnostic, set `enable_test_ingest` to `true`, restart, and run `.\tools\Test-ArchiveApi.ps1` elevated. Test records have an isolated path and never enter the live stream assembler. Disable it again after testing. The diagnostic does not verify the driver or a printer.
+
+`data/` contains the database, raw label bytes and access token; protect and back it up according to the sensitivity of the labels. `data/private/` is ignored by Git.
+
+## Testing
 
 ```powershell
-.\install\Install-StartupTask.ps1 -Mode System
+python -m unittest discover -s tests -v
+node --test tests/test_ui.js
 ```
 
-## Preview privacy
-
-The default configuration uses `https://api.labelary.com` for PNG previews. ZPL submitted for preview therefore leaves the workstation.
-
-To keep label contents local, edit `config.json`:
-
-```json
-"preview_provider": "disabled"
-```
-
-Capture, search, raw storage, and exact reprint continue to work.
-
-## Repository layout
-
-```text
-driver/                 Final KMDF filter source, INF, build/install/rollback
-server/app.py           Local archive API, SQLite store, capture poller, RAW reprint
-web/                    Local browser UI
-install/                Archive startup helpers
-tools/                  Discovery, diagnostics, API test utilities
-docs/ARCHITECTURE.md    End-to-end data path
-docs/DEPLOYMENT.md      Detailed repeatable deployment procedure
-docs/LESSONS_LEARNED.md Failed approaches and final fixes
-docs/TEST_SIGNING.md    Signing / error 577 guidance
-docs/RECOVERY.md        Rollback procedure
-config.json             Queue names, ports, target IDs, preview settings
-data/                    Runtime database / exact raw jobs / preview cache
-```
-
-## Original test environment
-
-The troubleshooting that produced this package was performed on Windows 10 Pro x64 build 19045 with Visual Studio 2022, WDK/SDK `10.0.26100.0`, and Python 3.13.15. The package is written for Windows 10 1903+ because the INF uses the declarative `AddFilter` model.
-
-## Verification status carried forward
-
-The final stack-advance fix was verified to allow normal printing with the filter loaded, including while the archive server was running. Earlier physical-layer builds proved that the selected physical USB interception point sees real print data. The original chat ended before the final STEP 6 build's history-entry and exact-reprint tests were explicitly confirmed, so those two checks remain part of every deployment acceptance test.
+The test suite covers segmentation, pending-chunk recovery, loss visibility, API authorization, preview consent, legacy database migration, and mocked spooler behavior. GitHub Actions includes a Windows driver compilation job, but compilation and mocked tests cannot substitute for signing, Driver Verifier, plug/unplug, load, reboot and physical-print acceptance tests.
