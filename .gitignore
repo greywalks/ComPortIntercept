@@ -1,0 +1,27 @@
+# Runtime archive data
+data/archive.db
+data/archive.db-*
+data/jobs/*
+!data/jobs/.gitkeep
+data/previews/*
+!data/previews/.gitkeep
+
+# Driver build output
+driver/x64/
+driver/ZebraUsbTap/x64/
+driver/*.cer
+driver/*.log
+driver/*.lastbuildstate
+*.pdb
+*.obj
+*.sys
+*.cat
+
+# Local deployment state
+.local/
+*.pre-step*
+*.bak
+
+# Python
+__pycache__/
+*.pyc
