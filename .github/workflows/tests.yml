@@ -8,8 +8,9 @@ permissions:
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-24.04, windows-latest]
         python: ['3.9', '3.12', '3.13']
     runs-on: ${{ matrix.os }}
     steps:
@@ -23,11 +24,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: microsoft/setup-msbuild@v2
+        with:
+          msbuild-architecture: x64
       - name: Compile the driver (unsigned)
         shell: pwsh
         run: |
           $kitRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\Include"
           $sdk = Get-ChildItem $kitRoot -Directory | Where-Object { Test-Path (Join-Path $_.FullName 'km\ntddk.h') } | Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
           if (-not $sdk) { throw 'Windows Driver Kit not available on runner' }
-          msbuild driver\ZebraUsbTap.sln /t:Build /p:Configuration=Debug /p:Platform=x64 /p:WindowsTargetPlatformVersion=$($sdk.Name) /p:SignMode=Off /m
+          $buildLog = Join-Path $env:RUNNER_TEMP 'driver-build.log'
+          msbuild driver\ZebraUsbTap.sln /t:Build /p:Configuration=Debug /p:Platform=x64 /p:WindowsTargetPlatformVersion=$($sdk.Name) /p:SignMode=Off /m /fl "/flp:logfile=$buildLog;verbosity=normal"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (Select-String -Path $buildLog -Pattern ':\s*error(?:\s|:)' -Quiet) { throw 'Driver build log contains an error, even though MSBuild returned success.' }

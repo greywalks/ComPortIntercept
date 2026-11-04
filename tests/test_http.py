@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -78,6 +79,17 @@ class HttpTests(unittest.TestCase):
 
 
 class TokenTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == 'nt', 'Windows ACL test')
+    def test_windows_token_acl_and_restart(self):
+        with tempfile.TemporaryDirectory() as root:
+            token = secure_token(root)
+            self.assertEqual(token, secure_token(root))
+            path = Path(root) / 'private' / 'api-token'
+            script = Path(root) / 'acl-check.ps1'
+            script.write_text("(Get-Acl -LiteralPath $args[0]).Access | ForEach-Object { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value + ':' + $_.IsInherited }", encoding='utf-8')
+            output = subprocess.check_output(['powershell.exe', '-NoProfile', '-File', str(script), str(path)], text=True)
+            self.assertEqual(set(output.splitlines()), {'S-1-5-18:False', 'S-1-5-32-544:False'})
+
     @unittest.skipIf(os.name == 'nt', 'POSIX permissions test')
     def test_token_is_stable_and_private(self):
         with tempfile.TemporaryDirectory() as root:
