@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ComPortIntercept - Zebra Print Archive</title>
+<style>
+body{font-family:Segoe UI,Arial,sans-serif;margin:0;background:#f4f6f8;color:#172033}
+header{padding:18px 24px;background:#172033;color:#fff;display:flex;justify-content:space-between;align-items:center}
+main{padding:20px;display:grid;grid-template-columns:1.2fr 1fr;gap:18px}
+section{background:#fff;border-radius:10px;box-shadow:0 2px 12px #0001;padding:16px}
+input{width:100%;box-sizing:border-box;padding:10px;margin-bottom:12px}
+table{width:100%;border-collapse:collapse;font-size:14px}th,td{padding:8px;border-bottom:1px solid #e6e9ee;text-align:left;vertical-align:top}
+tr:hover{background:#f8fafc;cursor:pointer}.muted{color:#6b7280}.ok{color:#0a7a36}.bad{color:#b42318}
+button{padding:9px 12px;border:0;border-radius:7px;background:#172033;color:#fff;cursor:pointer}
+pre{white-space:pre-wrap;word-break:break-word;background:#111827;color:#e5e7eb;padding:12px;border-radius:8px;max-height:320px;overflow:auto}
+img{max-width:100%;background:white;border:1px solid #ddd}
+@media(max-width:950px){main{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header>
+  <div><strong>ComPortIntercept</strong><div style="font-size:13px;opacity:.8">Zebra USB Print Archive</div></div>
+  <div id="status">Checking...</div>
+</header>
+<main>
+<section>
+<input id="q" placeholder="Search captured label text, queue, port, or origin">
+<table>
+<thead><tr><th>Time</th><th>Printer</th><th>Origin</th><th>Bytes</th><th>Text</th></tr></thead>
+<tbody id="rows"></tbody>
+</table>
+</section>
+<section>
+<h2 id="title">Select a print job</h2>
+<div id="meta" class="muted"></div>
+<p><button id="reprint" disabled>Reprint Exact Job</button></p>
+<div id="msg"></div>
+<div id="preview"></div>
+<h3>Captured Data</h3>
+<pre id="raw"></pre>
+</section>
+</main>
+<script>
+let selected=null;
+const $=id=>document.getElementById(id);
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+async function status(){
+  try{
+    const s=await fetch('/api/status',{cache:'no-store'}).then(r=>r.json());
+    $('status').textContent=s.capture_connected?'Capture online':'Web online - capture waiting';
+    $('status').className=s.capture_connected?'ok':'bad';
+    $('status').title=s.capture_error||'';
+  }catch{$('status').textContent='Offline';$('status').className='bad'}
+}
+async function jobs(){
+  const q=encodeURIComponent($('q').value.trim());
+  const list=await fetch('/api/jobs?q='+q,{cache:'no-store'}).then(r=>r.json());
+  $('rows').innerHTML=list.map(j=>`<tr onclick="pick(${j.id})"><td>${esc(new Date(j.captured_at).toLocaleString())}</td><td><b>${esc(j.printer_name)}</b><br><span class="muted">${esc(j.windows_port)}</span></td><td>${esc(j.origin)}</td><td>${j.byte_count}</td><td>${esc((j.text||'').slice(0,120))}</td></tr>`).join('');
+}
+async function pick(id){
+  selected=id;
+  const j=await fetch('/api/jobs/'+id,{cache:'no-store'}).then(r=>r.json());
+  $('title').textContent='Print Job #'+j.id;
+  $('meta').textContent=`${new Date(j.captured_at).toLocaleString()} • ${j.printer_name} • ${j.windows_port} • ${j.byte_count} bytes • SHA-256 ${j.sha256}`;
+  $('raw').textContent=j.text||'';
+  $('reprint').disabled=false;
+  $('msg').textContent='';
+  $('preview').innerHTML='<div class="muted">Loading preview...</div>';
+  const r=await fetch('/api/jobs/'+id+'/preview',{cache:'no-store'});
+  if(r.ok){
+    const b=await r.blob(); const u=URL.createObjectURL(b);
+    $('preview').innerHTML='<img alt="Label preview" src="'+u+'">';
+  }else{
+    const e=await r.json().catch(()=>({error:'Preview unavailable'}));
+    $('preview').innerHTML='<div class="muted">'+esc(e.error)+'</div>';
+  }
+}
+$('reprint').onclick=async()=>{
+  if(!selected)return;
+  if(!confirm('Send the exact archived bytes back to the original Zebra queue?'))return;
+  const r=await fetch('/api/jobs/'+selected+'/reprint',{method:'POST'});
+  const x=await r.json();
+  $('msg').textContent=r.ok?'Reprint submitted.':(x.error||'Reprint failed.');
+  jobs();
+};
+let t;$('q').oninput=()=>{clearTimeout(t);t=setTimeout(jobs,250)};
+status();jobs();setInterval(()=>{status();jobs()},5000);
+</script>
+</body>
+</html>
