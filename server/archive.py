@@ -97,9 +97,13 @@ class Archive:
             if "risk_acknowledged" not in reprint_columns:
                 c.execute("ALTER TABLE reprint_attempts ADD COLUMN risk_acknowledged INTEGER NOT NULL DEFAULT 0")
             c.execute("UPDATE jobs SET archived_at=captured_at WHERE archived_at IS NULL")
-            # Existing known drops conservatively taint the whole session.
+            # Previously recorded losses and restarts with unacknowledged
+            # driver data conservatively taint the whole old session too.
             c.execute("""INSERT OR IGNORE INTO capture_session_flags(session,reason,noticed_at)
                          SELECT session,'reported-drop',MIN(seen_at) FROM capture_losses GROUP BY session""")
+            c.execute("""INSERT OR IGNORE INTO capture_session_flags(session,reason,noticed_at)
+                         SELECT previous_session,'restart-with-queued-data',MIN(seen_at)
+                         FROM capture_restarts WHERE previous_queued_bytes > 0 GROUP BY previous_session""")
             c.execute("""UPDATE jobs SET integrity='capture-loss-possible'
                          WHERE integrity <> 'capture-loss-possible'
                          AND driver_session IN (SELECT session FROM capture_session_flags)""")

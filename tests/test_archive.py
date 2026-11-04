@@ -105,6 +105,21 @@ class ArchiveTests(unittest.TestCase):
         try: self.assertEqual(c.execute('SELECT risk_acknowledged FROM reprint_attempts WHERE id=?',(attempt,)).fetchone()[0], 1)
         finally: c.close()
 
+    def test_migration_flags_prior_restart_with_queued_data(self):
+        self.add(1, b'PREVIOUS'); self.assembler.flush_idle(force=True)
+        job = self.first()
+        self.archive.observe_session('s', 10)
+        self.archive.observe_session('new', 0)
+        c = self.archive.connect()
+        try:
+            with c:
+                c.execute('DELETE FROM capture_session_flags')
+                c.execute("UPDATE jobs SET integrity='unverified-stream' WHERE id=?", (job['id'],))
+        finally: c.close()
+        migrated = Archive(self.tmp.name, PRINTERS)
+        self.assertEqual(migrated.get_job(job['id'])['integrity'], 'capture-loss-possible')
+        with self.assertRaises(PermissionError): migrated.start_reprint(job)
+
     def test_search_finds_text_after_nul_without_changing_raw_bytes(self):
         raw = b'\0^XA^FDCUSTOMER-123^FS^XZ'
         job = self.archive.save_demo(1, raw)
