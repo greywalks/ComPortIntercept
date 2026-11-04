@@ -1,0 +1,36 @@
+#pragma once
+
+#include <ntddk.h>
+#include <wdf.h>
+
+#define ZEBRA_TARGET_GK420D 1
+#define ZEBRA_TARGET_ZP500  2
+
+#define IOCTL_ZEBRAUSBTAP_GET_NEXT \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_READ_DATA)
+
+typedef struct _DEVICE_CONTEXT {
+    ULONG TargetId;
+} DEVICE_CONTEXT, *PDEVICE_CONTEXT;
+
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, DeviceGetContext)
+
+typedef struct _CAPTURE_NODE {
+    LIST_ENTRY Link;
+    ULONG TargetId;
+    ULONG Length;
+    ULONGLONG Stamp;
+    UCHAR Data[1];
+} CAPTURE_NODE, *PCAPTURE_NODE;
+
+typedef struct _CAPTURE_OUTPUT {
+    ULONG TargetId;
+    ULONG Length;
+    ULONGLONG Stamp;
+    UCHAR Data[1];
+} CAPTURE_OUTPUT, *PCAPTURE_OUTPUT;
+
+DRIVER_INITIALIZE DriverEntry;
+EVT_WDF_DRIVER_DEVICE_ADD ZebraEvtDeviceAdd;
+EVT_WDFDEVICE_WDM_IRP_PREPROCESS ZebraEvtWdmWritePreprocess;
+EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL ZebraEvtIoDeviceControl;

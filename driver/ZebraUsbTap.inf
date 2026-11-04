@@ -1,0 +1,65 @@
+; ZebraUsbTap device-specific upper-filter extension INF.
+; Captures writes above usbprint.sys for two known Zebra USB printer models.
+; AddFilter requires Windows 10 version 1903 (build 18362) or later.
+
+[Version]
+Signature="$WINDOWS NT$"
+Class=Extension
+ClassGuid={e2f84ce7-8efa-411c-aa69-97454ca4cb57}
+ExtensionId={C7F98C91-01C5-4C69-97D5-28C6D6E59B48}
+Provider=%ProviderName%
+DriverVer=11/04/2026,1.0.0.0
+CatalogFile=ZebraUsbTap.cat
+PnpLockdown=1
+
+[DestinationDirs]
+DefaultDestDir=13
+DriverCopy=13
+
+[SourceDisksNames]
+1=%DiskName%,,,
+
+[SourceDisksFiles]
+ZebraUsbTap.sys=1
+
+[Manufacturer]
+%ProviderName%=Models,NTamd64.10.0...18362
+
+[Models.NTamd64.10.0...18362]
+%GK420dDesc%=FilterInstall,USB\VID_0A5F&PID_0080
+%ZP500Desc%=FilterInstall,USB\VID_0A5F&PID_0062
+
+[FilterInstall.NT]
+CopyFiles=DriverCopy
+
+[FilterInstall.NT.Services]
+AddService=ZebraUsbTap,,ServiceInstall
+
+[FilterInstall.NT.Filters]
+AddFilter=ZebraUsbTap,,FilterDef
+
+[FilterInstall.NT.Wdf]
+KmdfService=ZebraUsbTap,ZebraUsbTap_Wdf
+
+[FilterDef]
+FilterPosition=Upper
+
+[ZebraUsbTap_Wdf]
+KmdfLibraryVersion=$KMDFVERSION$
+
+[ServiceInstall]
+DisplayName=%ServiceName%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%13%\ZebraUsbTap.sys
+
+[DriverCopy]
+ZebraUsbTap.sys
+
+[Strings]
+ProviderName="Local Zebra Archive"
+ServiceName="Zebra USB Print Capture Filter"
+DiskName="Zebra USB Print Capture Driver Package"
+GK420dDesc="Zebra GK420d USB Print Capture Extension"
+ZP500Desc="Zebra ZP 500 USB Print Capture Extension"
